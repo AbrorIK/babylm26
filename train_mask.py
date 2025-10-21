@@ -39,6 +39,7 @@ parser.add_argument("--all_checkpoints", action="store_true", help="Save and eva
                     per challenge stipulations. Overrides eval_steps and save_steps.")
 parser.add_argument("--log_mlm_probs", action="store_true", help="Log MLM probabilities for analysis")
 parser.add_argument("--mask_update_steps", type=int, default=100)
+parser.add_argument("--first_mask_update", type=int, default=0, help="Do not update mask before this global step")
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
@@ -102,12 +103,8 @@ def regroup_texts(args, max_seq_len):
         desc = "Grouping",
         # load_from_cache_file=False,
         )
-    change_ratio = cur_max_seq_len / max_seq_len
-    grad_acc_change = args.grad_acc * change_ratio
-    if grad_acc_change >= 1 and int(grad_acc_change) == grad_acc_change:
-        args.grad_acc = int(grad_acc_change)
-    else:
-        args.batch_size = int(args.batch_size * change_ratio)
+    change_ratio = max_seq_len / cur_max_seq_len
+    args.batch_size = max(1, int(args.batch_size / change_ratio))
     
     train_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['train'], 
@@ -326,10 +323,10 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
     mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob).to(device="cuda:0")
     mask_stats = {
-        'correct': torch.zeros(tokenizer.vocab_size), 
-        'incorrect': torch.zeros(tokenizer.vocab_size),
-        'loss': torch.zeros(tokenizer.vocab_size) + torch.log(torch.tensor(mask_weights.shape[0])).item(),
-        'total': torch.ones(tokenizer.vocab_size)
+        'correct': torch.zeros(tokenizer.vocab_size, dtype=torch.float32), 
+        'incorrect': torch.zeros(tokenizer.vocab_size, dtype=torch.float32),
+        'loss': torch.zeros(tokenizer.vocab_size, dtype=torch.float32) + torch.log(torch.tensor(mask_weights.shape[0])).item(),
+        'total': torch.ones(tokenizer.vocab_size, dtype=torch.float32)
         }
     mask_stats = move_dict_to_cuda_bf16(mask_stats)
     if args.log_mlm_probs:
@@ -354,7 +351,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     args.max_seq_len = args.max_seq_len[1:]
 
             for step, batch in enumerate(train_dataloader):
-                all_logits = None
                 masked_batch = mask_batch(batch, 
                                           tokenizer, mask_weights.to(device="cpu"), 
                                           mlm_prob=args.mlm_prob, 
@@ -382,9 +378,24 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                         outputs = model(**move_dict_to_cuda(minibatch))
                         loss = outputs.loss
 
-                        # accumulate logits
-                        all_logits = outputs.logits if all_logits is None else torch.cat((all_logits, outputs.logits), dim=0)
+                    # Update stats per-minibatch and discard logits
+                    if not args.regular_mlm:
+                        with torch.no_grad():
+                            if args.soft:
+                                mask_stats = get_batch_accuracy_soft(
+                                    minibatch["input_ids"].to(device="cuda:0"),
+                                    outputs.logits.detach(),
+                                    minibatch["labels"].to(device="cuda:0"),
+                                    mask_stats,
+                                )
+                            else:
+                                mask_stats = get_batch_accuracy(
+                                    outputs.logits.detach(),
+                                    minibatch["labels"].to(device="cuda:0"),
+                                    mask_stats,
+                                )
 
+                    loss = loss / args.grad_acc # To ensure consistent gradient magnitude
                     loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -392,18 +403,14 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # need to do on cuda to be fast
-                if not args.regular_mlm:
-                    if args.soft:
-                        mask_stats = get_batch_accuracy_soft(
-                            masked_batch["input_ids"].to(device="cuda:0"), 
-                            all_logits, 
-                            masked_batch["labels"].to(device="cuda:0"), 
-                            mask_stats)
-                    else:
-                        mask_stats = get_batch_accuracy(all_logits, masked_batch["labels"].to(device="cuda:0"), mask_stats)
+                # stats already updated per-minibatch; nothing to do here
 
-                if global_step % args.mask_update_steps == 0 and global_step != 0 and not args.regular_mlm:
+                if (
+                    global_step % args.mask_update_steps == 0
+                    and global_step != 0
+                    and global_step >= args.first_mask_update
+                    and not args.regular_mlm
+                ):
                     if args.soft:
                         mask_weights = update_mask_weights_soft(mask_weights, mask_stats, args.mlm_prob)
                     else:

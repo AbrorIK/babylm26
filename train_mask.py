@@ -317,7 +317,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.lamb:
         optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=0.1)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
     model.train()
@@ -526,6 +526,9 @@ def main():
     if args.custom == "nhot":
         from ngram_model import NGramDebertaV2ForMaskedLM
         model = NGramDebertaV2ForMaskedLM(config, tokenizer)
+    elif args.custom == "lora":
+        from ngram_model import LoraModelForMaskedLM
+        model = LoraModelForMaskedLM(config)
     else:
         model = AutoModelForMaskedLM.from_config(config, trust_remote_code=True)
 

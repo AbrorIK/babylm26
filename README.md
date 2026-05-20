@@ -1,6 +1,6 @@
 # BabyLM25
 
-This repo contains our code for reproducing our BabyLM2025 submissions.
+This repo contains our code for reproducing our [BabyLM2025 submission](https://aclanthology.org/2025.babylm-main.31/).
 You can find our trained models here: https://huggingface.co/collections/leukas/babylm-2025-68a74f07d8570c914c69e4be
 
 ## Training

@@ -23,15 +23,15 @@ except ImportError:
 parser = argparse.ArgumentParser()
 parser.add_argument("--train_data", type=str, default="")
 parser.add_argument("--valid_data", type=str, default="data/even.dev")
-parser.add_argument("--max_seq_len", type=str, default="64", help="Either num or e.g. 0:64,5:128")
+parser.add_argument("--max_seq_len", type=str, default="0:64,5:256", help="Either num or e.g. 0:32,5:64")  
 parser.add_argument("--model_path", type=str, default="microsoft/deberta-v3-base")
 parser.add_argument("--output_path", type=str, default="")
 parser.add_argument("--tokenizer", type=str, default=None)
-parser.add_argument("--batch_size", type=int, default=256)
-parser.add_argument("--grad_acc", type=int, default=1)
+parser.add_argument("--batch_size", type=int, default=256, help="Number of examples per forward pass. Not affected by grad_acc.")
+parser.add_argument("--grad_acc", type=int, default=1, help="Split the batch size into N mini-batches.")
 parser.add_argument("--lr", type=float, default=0.007)
 parser.add_argument("--epochs", type=int, default=10)
-parser.add_argument("--cpus", type=int, default=64)
+parser.add_argument("--cpus", type=int, default=10)
 parser.add_argument("--logging_steps", type=int, default=100)
 parser.add_argument("--eval_steps", type=int, default=1000)
 parser.add_argument("--save_steps", type=int, default=1000)
@@ -43,7 +43,7 @@ parser.add_argument("--first_mask_update", type=int, default=0, help="Do not upd
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--weight_decay", type=float, default=0.01)
+parser.add_argument("--weight_decay", type=float, default=0.1)
 parser.add_argument("--mlm_prob", type=float, default=0.15)
 parser.add_argument("--mask_replace_prob", type=float, default=0.8)
 parser.add_argument("--random_replace_prob", type=float, default=0.1)
@@ -58,6 +58,7 @@ parser.add_argument("--lamb", action="store_true", help="LAMB optimization")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--soft", action="store_true", help="Soft mask")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
+parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
 parser.add_argument("--mask_decay", type=float, default=0.0, help="Mask decay. e.g. 0.1 means decay by 0.1 \
                     over the course of training")
 
@@ -246,7 +247,6 @@ def move_dict_to_cuda(d):
 def move_dict_to_cuda_bf16(d):
     return {key: value.to(dtype=torch.bfloat16, device="cuda:0") for key, value in d.items()}
 
-
 def reset_stats(mask_stats):
     mask_stats = {
         'correct': torch.zeros_like(mask_stats['correct']), 
@@ -290,7 +290,6 @@ def calculate_total_steps(args):
         total_steps = total_steps + batches_per_epoch * (args.epochs - cur_epoch)
         return total_steps
 
-
 def is_step(step_type: str, global_step: int, args):
     # step_arg = args.logging_steps, args.save_steps, or args.eval_steps
     step_arg = getattr(args, f'{step_type}_steps')
@@ -317,9 +316,16 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
+    # Note: Gradient checkpointing disabled as requested
+    # Note: GradScaler not needed with bfloat16
+
     model.train()
     model = model.to(dtype=torch.bfloat16, device="cuda:0")
 
+    if args.log_gpu_mem:
+        # Print memory usage
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob).to(device="cuda:0")
     mask_stats = {
@@ -377,6 +383,16 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
                         outputs = model(**move_dict_to_cuda(minibatch))
                         loss = outputs.loss
+                        
+                        # Add z-loss
+                        logits = outputs.logits  # [B,T,V]
+                        labels = minibatch["labels"].to(device=logits.device)
+                        valid = labels.ne(-100)
+                        z = torch.logsumexp(logits, dim=-1)  # [B,T]
+                        z = z.masked_select(valid)
+                        z_loss = (z**2).mean() if z.numel() else torch.tensor(0., device=logits.device)
+                        lam = 0.0001  # z-loss coefficient
+                        loss = loss + lam * z_loss
 
                     # Update stats per-minibatch and discard logits
                     if not args.regular_mlm:
@@ -397,7 +413,8 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
                     loss = loss / args.grad_acc # To ensure consistent gradient magnitude
                     loss.backward()
-
+                    
+                # Gradient clipping and optimizer step
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
@@ -448,13 +465,23 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 if is_step("logging", global_step, args):
                     epoch_float = global_step * args.epochs / args.total_steps
                     print(f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
-
+                    
+                    if args.log_gpu_mem:
+                        print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                        print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+                    
                     if args.wandb:
-                        wandb.log({
+                        log_dict = {
                             "epoch": epoch_float,
                             "loss": loss.item(),
                             "lr": scheduler.get_last_lr()[0]
-                        })
+                        }
+                        if args.log_gpu_mem:
+                            log_dict.update({
+                                "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,
+                                "gpu_memory_reserved": torch.cuda.memory_reserved() / 1024**3
+                            })
+                        wandb.log(log_dict)
 
                 # ----- EVALUATION -----
                 if is_step("eval", global_step, args):
@@ -512,7 +539,7 @@ def main():
             config=vars(args),   
         )
 
-    tokenizer = DebertaV2Tokenizer(args.tokenizer, do_lower_case=args.lower)
+    tokenizer = DebertaV2Tokenizer.from_pretrained(args.tokenizer, do_lower_case=args.lower)
 
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
 
@@ -619,7 +646,7 @@ def main():
         batch_size=args.batch_size, 
         num_workers=args.cpus,
         shuffle=True, 
-        collate_fn=padding_collate_fn
+        collate_fn=padding_collate_fn,
         )
     
     eval_dataloader = torch.utils.data.DataLoader(
@@ -627,7 +654,7 @@ def main():
         batch_size=args.batch_size, 
         num_workers=args.cpus,
         shuffle=False, 
-        collate_fn=padding_collate_fn
+        collate_fn=padding_collate_fn,
         )
 
     train(args, model, tokenizer, train_dataloader, eval_dataloader)

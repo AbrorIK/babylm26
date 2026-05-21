@@ -2,26 +2,6 @@
 import torch
 from transformers.data.data_collator import DataCollatorForLanguageModeling
 
-# def group_texts(examples, max_len, pad_token_id):
-#     grouped = {
-#         'input_ids': [],
-#         'attention_mask': [],
-#         'labels': []
-#     }
-
-#     for i in range(len(examples['input_ids'])):
-#         for j in range(0, len(examples['input_ids'][i]), max_len):
-#             if j + max_len > len(examples['input_ids'][i]):
-#                 grouped['input_ids'].append(examples['input_ids'][i][j:] + [pad_token_id] * (max_len - (len(examples['input_ids'][i]) - j)))
-#                 grouped['attention_mask'].append(examples['attention_mask'][i][j:] + [0] * (max_len - (len(examples['input_ids'][i]) - j)))
-#                 grouped['labels'].append(examples['labels'][i][j:] + [pad_token_id] * (max_len - (len(examples['input_ids'][i]) - j)))
-#             else:
-#                 grouped['input_ids'].append(examples['input_ids'][i][j : j + max_len])
-#                 grouped['attention_mask'].append(examples['attention_mask'][i][j : j + max_len])
-#                 grouped['labels'].append(examples['labels'][i][j : j + max_len])
-
-#     return grouped
-
 def group_texts(examples, max_len):
     # Concatenate all texts.
     try:

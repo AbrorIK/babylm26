@@ -49,3 +49,7 @@ All flags are explained here:
 --flops                 Compute FLOPs during training.
 --mask_decay            Mask decay rate. For example, 0.1 decays masking probability linearly by 0.1 over training.
 ```
+
+## Acknowledgements
+
+This project is a fork of the [babylm25](https://github.com/Leukas/babylm25) repository developed by my supervisor, Lukas. I am extending this work as part of my thesis research.

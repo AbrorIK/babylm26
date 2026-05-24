@@ -15,4 +15,4 @@ wandb>=0.16.0
 # Optional: FLOPs estimation (only if using --flops)
 fvcore>=0.1.5
 
-dotenv>=1.0.0
+python-dotenv>=1.0.0

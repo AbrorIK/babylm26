@@ -1,15 +1,15 @@
-# BabyLM25
-
-This repo contains our code for reproducing our [BabyLM2025 submission](https://aclanthology.org/2025.babylm-main.31/).
-You can find our trained models here: https://huggingface.co/collections/leukas/babylm-2025-68a74f07d8570c914c69e4be
+# BabyLM26
 
 ## Training
+
 To train our hard_decay model, for example, run:
+
 ```bash
 python train_mask.py --train_data data/bb24.train --valid_data data/bb25_small.dev --tokenizer tokenizers/bb24.model --output_path models/test_model/ --mask_update_steps 200 --logging_steps 200 --intermediate_size 1280 --hidden_size 384 --max_seq_len 0:64,5:256 --lamb --all_checkpoints --mlm_prob 0.4 --mask_decay 0.25 --seed 0
 ```
 
 All flags are explained here:
+
 ```
 --train_data            Path to the training data file.
 --valid_data            Path to the validation data file.

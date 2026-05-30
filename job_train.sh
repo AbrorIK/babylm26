@@ -1,12 +1,11 @@
 #!/bin/bash
-#SBATCH -J babylm-mask                                  # Job name
-#SBATCH -p lrz-v100x2                                  # Partition
-#SBATCH --gres=gpu:1                                    # Request 1 GPU
-#SBATCH --cpus-per-task=10                              # CPUs for data loading (increased to 10 to match your python script)
-#SBATCH --mem=32G                                       # Memory
-#SBATCH --time=24:00:00                                 # Max wall time
-#SBATCH -o logs/log_%j.out                              # Standard output
-#SBATCH -e logs/log_%j.err                              # Standard error
+#SBATCH -J babylm-mask
+#SBATCH -p a100
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=8:00:00
+#SBATCH -o logs/log_%j.out
+#SBATCH -e logs/log_%j.err
 
 # ---- Setup ----
 echo "=========================================="
@@ -18,27 +17,26 @@ echo "CPUs:         $SLURM_CPUS_PER_TASK"
 echo "Start time:   $(date)"
 echo "=========================================="
 
-# Navigate to project directory
-PROJECT_DIR=/dss/dsshome1/09/ge58lix2/babylm26
+export http_proxy=http://proxy.nhr.fau.de:80
+export https_proxy=http://proxy.nhr.fau.de:80
+
+PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
 
-# Activate virtual environment
-source ../.venv/bin/activate
+source .venv/bin/activate
 
-# Force Python to print logs instantly instead of buffering them
 export PYTHONUNBUFFERED=1
 
 # ---- Configuration Variables ----
-# Change these paths to match your actual files!
-TRAIN_DATA="data/bb26_30m_train.txt"
-VALID_DATA="data/bb26_30m_validation.txt"
-TOKENIZER_DIR="tokenizers/bb26.model"             # Folder containing spm.model & tokenizer_config.json
-OUTPUT_DIR="output/babylm_deberta_run"
+TRAIN_DATA="data/tlm_30m_train.txt"
+VALID_DATA="data/tlm_30m_validation.txt"
+TOKENIZER_DIR="tokenizers/bb26.model"             
+OUTPUT_DIR="output/tlm-30m"
 
 echo "Starting training..."
 
 # ---- Run Training ----
-srun python train_mask_basic.py \
+python train_mask.py \
     --train_data $TRAIN_DATA \
     --valid_data $VALID_DATA \
     --tokenizer $TOKENIZER_DIR \
@@ -48,7 +46,7 @@ srun python train_mask_basic.py \
     --batch_size 256 \
     --grad_acc 8 \
     --epochs 10 \
-    --lr 0.007 \
+    --lr 5e-4 \
     --cpus $SLURM_CPUS_PER_TASK \
     --all_checkpoints \
     --wandb

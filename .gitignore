@@ -180,3 +180,4 @@ data/
 wandb/
 output/
 logs/
+nltk_data/

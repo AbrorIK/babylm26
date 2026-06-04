@@ -2,6 +2,10 @@ import random
 import os
 from dotenv import load_dotenv
 from datasets import load_dataset
+from code_switch_preprocessing import (
+    load_dictionary, code_switch_sentence,
+    DICT_EN_NL, DICT_EN_ZH,
+)
 
 BYTE_PREMIUM_FACTOR_ENGLISH = 1.000000
 BYTE_PREMIUM_FACTOR_DUTCH = 1.051606
@@ -21,6 +25,9 @@ INPUT_FILES = {
 
 OUTPUT_TRAIN = './data/bb26_30m_train.txt'
 OUTPUT_VALIDATION = './data/bb26_30m_validation.txt'
+
+OUTPUT_CODE_SWITCHING_TRAIN = './data/bb26_cs_train.txt'
+OUTPUT_CODE_SWITCHING_VALIDATION = './data/bb26_cs_validation.txt'
 
 # TLM dataset outputs
 TLM_OUTPUT_TRAIN = './data/tlm_30m_train.txt'
@@ -54,6 +61,7 @@ OPENSUBS_INPUT_FILES = {
     ],
 }
 
+
 def load_and_save_datasets():
     load_dotenv()
     my_token = os.getenv("AUTH_TOKEN")
@@ -73,48 +81,93 @@ def load_and_save_datasets():
         print(f"Finished! Saved to {file_path}")
 
 def mix_and_sample():
-    all_sampled_lines = []
+    # ------------------------------------------------------------------ #
+    # Load bilingual dictionaries for code-switching (English only)        #
+    # ------------------------------------------------------------------ #
+    if os.path.isfile(DICT_EN_NL) and os.path.isfile(DICT_EN_ZH):
+        print(f"Loading EN→NL dictionary from {DICT_EN_NL} …")
+        dict_nl = load_dictionary(DICT_EN_NL)
+        print(f"  → {len(dict_nl):,} entries")
 
-    for lang, filepath in INPUT_FILES.items():
+        print(f"Loading EN→ZH dictionary from {DICT_EN_ZH} …")
+        dict_zh = load_dictionary(DICT_EN_ZH)
+        print(f"  → {len(dict_zh):,} entries")
+        do_code_switch = True
+    else:
+        print("WARNING: MUSE dictionaries not found — skipping code-switching.")
+        print(f"  Expected: {DICT_EN_NL} and {DICT_EN_ZH}")
+        do_code_switch = False
+        dict_nl, dict_zh = {}, {}
+
+    phase1_lines = [] # First 20M tokens (Pure)
+    phase2_lines = [] # Last 10M tokens (Code-Switched)
+
+    for lang, filepaths in OPENSUBS_INPUT_FILES.items():
         print(f"Processing {lang}...")
-        limit = targets[lang]
-        current_words = 0
-        lang_lines = []
         
-        with open(filepath, 'r', encoding='utf-8') as f:
-            for line in f:
-                words = line.split()
-                if not words:
-                    continue
-                
-                num_words = len(words)
-                if current_words + num_words <= limit:
-                    lang_lines.append(line.strip())
-                    current_words += num_words
-                else:
-                    needed = limit - current_words
-                    if needed > 0:
-                        lang_lines.append(" ".join(words[:needed]))
-                        current_words += needed
-                    break
+        # Calculate 1/2 for Phase 1, 1/2 for Phase 2
+        limit_total = targets[lang]
+        limit_phase1 = int(limit_total * (1/2))
+        limit_phase2 = limit_total - limit_phase1
+        
+        current_words = 0
+        lang_lines_phase1 = []
+        lang_lines_phase2 = []
+        
+        for filepath in filepaths:
+            if current_words >= limit_total:
+                break
+            print(f"  Reading {filepath} …")
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    words = line.split()
+                    if not words:
+                        continue
                     
-        print(f"Extracted {current_words} words for {lang}.")
-        all_sampled_lines.extend(lang_lines)
+                    num_words = len(words)
+                    # Fill Phase 1 first
+                    if current_words < limit_phase1:
+                        lang_lines_phase1.append(line.strip())
+                        current_words += num_words
+                    # Then fill Phase 2
+                    elif current_words < limit_total:
+                        lang_lines_phase2.append(line.strip())
+                        current_words += num_words
+                    else:
+                        break
+        
+        # ----- Code-switch Phase 2 (English only) ----- #
+        if lang == 'eng' and do_code_switch:
+            cs_count = 0
+            for i in range(len(lang_lines_phase2)):
+                switched = code_switch_sentence(lang_lines_phase2[i], dict_nl, dict_zh)
+                if switched != lang_lines_phase2[i]:
+                    cs_count += 1
+                lang_lines_phase2[i] = switched
+            print(f"  → Code-switched {cs_count:,} lines in Phase 2")
 
-    print("\nShuffling the combined lines...")
+        phase1_lines.extend(lang_lines_phase1)
+        phase2_lines.extend(lang_lines_phase2)
+
+    # Shuffle Phase 1 and Phase 2 INDEPENDENTLY
+    print("\nShuffling Phase 1 and Phase 2 internally...")
     random.seed(42)
-    random.shuffle(all_sampled_lines)
+    random.shuffle(phase1_lines)
+    random.shuffle(phase2_lines)
+
+    # Combine them sequentially: Phase 1 followed by Phase 2
+    all_sampled_lines = phase1_lines + phase2_lines
 
     train_lines = all_sampled_lines[:int(0.9 * len(all_sampled_lines))]
     validation_lines = all_sampled_lines[int(0.9 * len(all_sampled_lines)):]
 
-    print(f"Writing training dataset to {OUTPUT_TRAIN}...")
-    with open(OUTPUT_TRAIN, 'w', encoding='utf-8') as f:
+    print(f"Writing training dataset to {OUTPUT_CODE_SWITCHING_TRAIN}...")
+    with open(OUTPUT_CODE_SWITCHING_TRAIN, 'w', encoding='utf-8') as f:
         for line in train_lines:
             f.write(line + '\n')
 
-    print(f"Writing validation dataset to {OUTPUT_VALIDATION}...")
-    with open(OUTPUT_VALIDATION, 'w', encoding='utf-8') as f:
+    print(f"Writing validation dataset to {OUTPUT_CODE_SWITCHING_VALIDATION}...")
+    with open(OUTPUT_CODE_SWITCHING_VALIDATION, 'w', encoding='utf-8') as f:
         for line in validation_lines:
             f.write(line + '\n')
 
@@ -335,4 +388,4 @@ def create_tlm_dataset(
 
 
 if __name__ == "__main__":
-    mix_and_sample_opensubs()
+    mix_and_sample()

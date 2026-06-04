@@ -361,9 +361,16 @@ def main():
         )
 
     tokenizer = DebertaV2Tokenizer.from_pretrained(args.tokenizer, do_lower_case=args.lower)
+
+    # ---- Register code-switching control tokens ---- #
+    num_added = tokenizer.add_special_tokens({
+        'additional_special_tokens': ['[PREDICT_NL]', '[PREDICT_ZH]']
+    })
+    print(f"Added {num_added} code-switching control tokens to tokenizer")
+
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
 
-    config.vocab_size = tokenizer.vocab_size
+    config.vocab_size = len(tokenizer)   # reflects newly added tokens
     config.max_position_embeddings = 1024
     config.pad_token_id = tokenizer.pad_token_id
     config.bos_token_id = tokenizer.cls_token_id
@@ -377,6 +384,8 @@ def main():
     config.hidden_dropout_prob = args.dropout
 
     model = AutoModelForMaskedLM.from_config(config, trust_remote_code=True)
+    # Resize embeddings to accommodate the new control tokens
+    model.resize_token_embeddings(len(tokenizer))
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of model parameters: {num_params}")

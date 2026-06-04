@@ -1,4 +1,3 @@
-# train_mask_basic.py
 import argparse
 import os
 import math

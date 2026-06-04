@@ -26,8 +26,33 @@ OUTPUT_VALIDATION = './data/bb26_30m_validation.txt'
 TLM_OUTPUT_TRAIN = './data/tlm_30m_train.txt'
 TLM_OUTPUT_VALIDATION = './data/tlm_30m_validation.txt'
 
+# OpenSubtitles baseline (plain monolingual) dataset outputs
+OPENSUBS_OUTPUT_TRAIN = './data/opensubs_30m_train.txt'
+OPENSUBS_OUTPUT_VALIDATION = './data/opensubs_30m_validation.txt'
+
 # Target total token count to match bb26_30m (~30 million tokens)
 TLM_TOKEN_TARGET = 30_000_000
+
+# Per-language token targets for OpenSubtitles baseline (adjusted by byte premium)
+OPENSUBS_TARGETS = {
+    "eng": round(10_000_000 / BYTE_PREMIUM_FACTOR_ENGLISH),
+    "nld": round(10_000_000 / BYTE_PREMIUM_FACTOR_DUTCH),
+    "zho": round(10_000_000 / BYTE_PREMIUM_FACTOR_CHINESE),
+}
+
+# OpenSubtitles source files – plain monolingual sentences
+OPENSUBS_INPUT_FILES = {
+    "eng": [
+        "data/en-nl/OpenSubtitles.en-nl.en",  # English side of EN-NL corpus
+        "data/en-zh/OpenSubtitles.en-zh.en",   # English side of EN-ZH corpus
+    ],
+    "nld": [
+        "data/en-nl/OpenSubtitles.en-nl.nl",
+    ],
+    "zho": [
+        "data/en-zh/OpenSubtitles.en-zh.zh",
+    ],
+}
 
 def load_and_save_datasets():
     load_dotenv()
@@ -92,6 +117,83 @@ def mix_and_sample():
     with open(OUTPUT_VALIDATION, 'w', encoding='utf-8') as f:
         for line in validation_lines:
             f.write(line + '\n')
+
+def mix_and_sample_opensubs(
+    train_output: str = OPENSUBS_OUTPUT_TRAIN,
+    val_output: str = OPENSUBS_OUTPUT_VALIDATION,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+):
+    """
+    Build a 30M-token baseline dataset of plain monolingual sentences
+    sourced from the OpenSubtitles parallel corpora.
+
+    This is the fair comparison counterpart to the TLM dataset:
+    same source domain (OpenSubtitles), same total size (~30M tokens),
+    same per-language budget (~10M tokens adjusted by byte premium factors),
+    but sentences are kept as independent monolingual lines (no [SEP] pairing).
+
+    English tokens are drawn from both the EN-NL and EN-ZH English sides
+    (reading EN-NL first, then EN-ZH if more are needed).
+    """
+    all_sampled_lines: list[str] = []
+
+    for lang, filepaths in OPENSUBS_INPUT_FILES.items():
+        limit = OPENSUBS_TARGETS[lang]
+        current_words = 0
+        lang_lines: list[str] = []
+
+        print(f"Processing {lang} (target: {limit:,} tokens) …")
+
+        for filepath in filepaths:
+            if current_words >= limit:
+                break
+            print(f"  Reading {filepath} …")
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    words = line.split()
+                    if not words:
+                        continue
+
+                    num_words = len(words)
+                    if current_words + num_words <= limit:
+                        lang_lines.append(line.strip())
+                        current_words += num_words
+                    else:
+                        needed = limit - current_words
+                        if needed > 0:
+                            lang_lines.append(" ".join(words[:needed]))
+                            current_words += needed
+                        break
+
+        print(f"  → Extracted {current_words:,} tokens for {lang}.")
+        all_sampled_lines.extend(lang_lines)
+
+    print(f"\nTotal lines collected: {len(all_sampled_lines):,}")
+    print("Shuffling …")
+    random.seed(seed)
+    random.shuffle(all_sampled_lines)
+
+    # Train / validation split
+    split_idx = int((1.0 - val_ratio) * len(all_sampled_lines))
+    train_lines = all_sampled_lines[:split_idx]
+    val_lines = all_sampled_lines[split_idx:]
+
+    os.makedirs(os.path.dirname(train_output) or ".", exist_ok=True)
+
+    print(f"Writing {len(train_lines):,} training lines to {train_output} …")
+    with open(train_output, "w", encoding="utf-8") as f:
+        for line in train_lines:
+            f.write(line + "\n")
+
+    print(f"Writing {len(val_lines):,} validation lines to {val_output} …")
+    with open(val_output, "w", encoding="utf-8") as f:
+        for line in val_lines:
+            f.write(line + "\n")
+
+    print("Done! OpenSubtitles baseline dataset creation complete.")
+    print(f"  Train:      {train_output}")
+    print(f"  Validation: {val_output}")
 
 def convert_moses_to_tlm(en_filepath, target_filepath, output_filepath, sep_token="[SEP]"):
     print(f"Reading from {en_filepath} and {target_filepath}...")
@@ -233,4 +335,4 @@ def create_tlm_dataset(
 
 
 if __name__ == "__main__":
-    create_tlm_dataset()
+    mix_and_sample_opensubs()

@@ -28,8 +28,8 @@ nltk.download('punkt_tab', quiet=True)
 # ------------------------------------------------------------------ #
 DICT_EN_NL = './data/en-nl.txt'
 DICT_EN_ZH = './data/en-zh.txt'
-CS_SWAP_PROB = 0.15          # per-word swap probability
-DICT_MAX_ENTRIES = 20_000    # keep only top-N most frequent translations
+CS_SWAP_PROB = 0.30          # per-word swap probability
+DICT_MAX_ENTRIES = 40_000    # keep only top-N most frequent translations
 
 # POS tags for content words (nouns + verbs) that we allow code-switching on.
 # Determiners, prepositions, pronouns, conjunctions, etc. are never swapped.
@@ -126,28 +126,23 @@ def code_switch_sentence(
     words = word_tokenize(sentence)
     tagged = pos_tag(words)
 
-    swapped = False
     result: list[str] = []
 
     for word, tag in tagged:
-        # Only attempt replacement on nouns and verbs
-        if tag in _CONTENT_POS_TAGS and random.random() < swap_prob:
+        if tag in _CONTENT_POS_TAGS:
             replacement = chosen_dict.get(word.lower())
             if replacement is not None:
-                # Preserve original capitalisation heuristics
                 if word[0].isupper() and not word.isupper():
                     replacement = replacement.capitalize()
                 elif word.isupper():
                     replacement = replacement.upper()
+                result.append(control_token)
                 result.append(replacement)
-                swapped = True
                 continue
+
         result.append(word)
 
-    # Reconstruct with TreebankWordDetokenizer-style spacing
     out = _detokenize(result)
-    if swapped:
-        out = f"{control_token} {out}"
     return out
 
 
@@ -177,3 +172,5 @@ def _detokenize(tokens: list[str]) -> str:
             parts.append(' ')
             parts.append(tok)
     return ''.join(parts)
+
+

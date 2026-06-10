@@ -28,13 +28,13 @@ nltk.download('punkt_tab', quiet=True)
 # ------------------------------------------------------------------ #
 DICT_EN_NL = './data/en-nl.txt'
 DICT_EN_ZH = './data/en-zh.txt'
-CS_SWAP_PROB = 0.30          # per-word swap probability
+CS_SWAP_PROB = 1.0          # per-word swap probability
 DICT_MAX_ENTRIES = 40_000    # keep only top-N most frequent translations
 
 # POS tags for content words (nouns + verbs) that we allow code-switching on.
 # Determiners, prepositions, pronouns, conjunctions, etc. are never swapped.
 _CONTENT_POS_TAGS = frozenset({
-    'NN', 'NNS', 'NNP', 'NNPS',               # nouns
+    'NN', 'NNS',                              # nouns
     'VB', 'VBD', 'VBG', 'VBN', 'VBP', 'VBZ',  # verbs
 })
 
@@ -129,7 +129,7 @@ def code_switch_sentence(
     result: list[str] = []
 
     for word, tag in tagged:
-        if tag in _CONTENT_POS_TAGS:
+        if tag in _CONTENT_POS_TAGS and random.random() < swap_prob:
             replacement = chosen_dict.get(word.lower())
             if replacement is not None:
                 if word[0].isupper() and not word.isupper():

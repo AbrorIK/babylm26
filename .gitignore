@@ -173,7 +173,7 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-test.ipynb
+*.ipynb
 .vscode/
 data/
 .DS_Store

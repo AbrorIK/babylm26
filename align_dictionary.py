@@ -1,4 +1,3 @@
-# align_dictionary.py
 """
 ALIGN-MLM Step 1: Preprocess MUSE bilingual dictionaries into token-ID pairs.
 
@@ -6,9 +5,6 @@ For every (src_word, tgt_word) in a MUSE dictionary, tokenize both sides with
 the shared BPE tokenizer and store the two token-ID lists.  Keeps *all* pairs
 including multi-token ones.  Each pair is tagged with its language pair so they
 can be balanced during training.
-
-Usage:
-    from align_dictionary import load_align_dictionary, sample_dict_batch
 """
 
 import random

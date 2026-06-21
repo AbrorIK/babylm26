@@ -1,29 +1,28 @@
 import random
-import os
 
-# ---- Byte premium factors (information capacity per token) ----
-# Dutch tokens carry ~5% less info → need more tokens for same content.
-# Chinese tokens carry ~6% more info → need fewer tokens.
-BYTE_PREMIUM_ENGLISH = 1.000000
-BYTE_PREMIUM_DUTCH   = 1.051606
-BYTE_PREMIUM_CHINESE = 0.935966
+from dataset_common import (
+    BYTE_PREMIUM_DUTCH,
+    BYTE_PREMIUM_CHINESE,
+    adjusted_budget,
+    sample_to_budget,
+    write_train_val_split,
+)
+
+# ================================================================== #
+# Configuration                                                        #
+# ================================================================== #
 
 # ---- Token budget ----
-TOKEN_TARGET = 30_000_000        # total whitespace-token budget
+TOKEN_TARGET = 30_000_000  # total whitespace-token budget
 
-# ---- Per-corpus ratio (must sum to 1.0) ----
-# Controls how the base budget is split between EN-NL and EN-ZH pairs
-# BEFORE applying byte premium adjustments.
+# ---- Per-corpus ratio (must sum to 1.0), applied BEFORE byte-premium adjust ----
 RATIO_EN_NL = 0.5
 RATIO_EN_ZH = 0.5
 
-# ---- Per-corpus adjusted budgets ----
-# Divide by target-language byte premium so that both corpora contribute
-# the same amount of *information*, not the same raw token count.
-BUDGET_EN_NL = round((TOKEN_TARGET * RATIO_EN_NL) / BYTE_PREMIUM_DUTCH)
-BUDGET_EN_ZH = round((TOKEN_TARGET * RATIO_EN_ZH) / BYTE_PREMIUM_CHINESE)
+BUDGET_EN_NL = adjusted_budget(TOKEN_TARGET, RATIO_EN_NL, BYTE_PREMIUM_DUTCH)
+BUDGET_EN_ZH = adjusted_budget(TOKEN_TARGET, RATIO_EN_ZH, BYTE_PREMIUM_CHINESE)
 
-# ---- Parallel corpus file paths ----
+# ---- Parallel corpus file paths (relative to project root) ----
 CORPUS_EN_NL = {
     "en":     "data/en-nl/OpenSubtitles.en-nl.en",
     "target": "data/en-nl/OpenSubtitles.en-nl.nl",
@@ -56,20 +55,6 @@ def load_parallel_pairs(en_path: str, tgt_path: str, sep_token: str) -> list[str
     return pairs
 
 
-def sample_to_budget(lines: list[str], token_budget: int) -> list[str]:
-    """Keep lines from the list until the whitespace-token budget is exhausted."""
-    sampled: list[str] = []
-    total = 0
-    for line in lines:
-        n = len(line.split())
-        if total + n <= token_budget:
-            sampled.append(line)
-            total += n
-        else:
-            break
-    return sampled
-
-
 def create_tlm_dataset():
     print(f"Token budget  EN-NL: {BUDGET_EN_NL:,} tokens (adjusted by Dutch  BPF={BYTE_PREMIUM_DUTCH})")
     print(f"Token budget  EN-ZH: {BUDGET_EN_ZH:,} tokens (adjusted by Chinese BPF={BYTE_PREMIUM_CHINESE})")
@@ -94,28 +79,17 @@ def create_tlm_dataset():
     print(f"\nSampled EN-NL: {len(sampled_nl):,} lines (~{BUDGET_EN_NL:,} tokens)")
     print(f"Sampled EN-ZH: {len(sampled_zh):,} lines (~{BUDGET_EN_ZH:,} tokens)")
 
-    # --- Pool, shuffle, and split ---
+    # --- Pool, shuffle, split, write (SEED already set above; do not reseed) ---
     all_lines = sampled_nl + sampled_zh
-    random.shuffle(all_lines)
-
-    split_idx   = int((1.0 - VALIDATION_RATIO) * len(all_lines))
-    train_lines = all_lines[:split_idx]
-    val_lines   = all_lines[split_idx:]
-
-    # --- Write to disk ---
-    os.makedirs(os.path.dirname(OUTPUT_TRAIN) or ".", exist_ok=True)
-
-    with open(OUTPUT_TRAIN, "w", encoding="utf-8") as f:
-        for line in train_lines:
-            f.write(line + "\n")
-
-    with open(OUTPUT_VALIDATION, "w", encoding="utf-8") as f:
-        for line in val_lines:
-            f.write(line + "\n")
+    train_lines, val_lines = write_train_val_split(
+        all_lines, OUTPUT_TRAIN, OUTPUT_VALIDATION,
+        val_ratio=VALIDATION_RATIO, shuffle=True,
+    )
 
     print(f"\nDone!")
     print(f"  Train:      {OUTPUT_TRAIN}  ({len(train_lines):,} lines)")
     print(f"  Validation: {OUTPUT_VALIDATION}  ({len(val_lines):,} lines)")
+
 
 if __name__ == '__main__':
     create_tlm_dataset()

@@ -1,13 +1,9 @@
-# align_loss.py
 """
 ALIGN-MLM Steps 3 & 5: Embedding-alignment loss and intrinsic evaluation.
 
 The alignment loss operates directly on the embedding table (no forward pass
 needed).  For multi-token words, subword embeddings are mean-pooled into a
 single vector before computing cosine similarity.
-
-Usage:
-    from align_loss import align_loss_batch, compute_alignment_accuracy
 """
 
 from typing import List, Tuple

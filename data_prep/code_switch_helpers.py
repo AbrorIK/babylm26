@@ -1,4 +1,3 @@
-# code_switch_preprocessing.py
 """
 Offline Code-Switching (Cross-Lingual Word Replacement) for BabyLM 2026.
 
@@ -6,12 +5,6 @@ This module provides utilities to probabilistically replace English
 **nouns and verbs** with their Dutch or Chinese translations using MUSE
 bilingual dictionaries.  It is designed to run as an offline preprocessing
 step so that the downstream MLM training loop remains unchanged.
-
-Usage:
-    from code_switch_preprocessing import (
-        load_dictionary, code_switch_sentence,
-        DICT_EN_NL, DICT_EN_ZH,
-    )
 """
 
 import random

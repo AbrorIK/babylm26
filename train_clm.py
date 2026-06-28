@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from transformers import set_seed
-from transformers import AutoConfig, AutoModelForMaskedLM, DebertaV2Tokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, DebertaV2Tokenizer
 from transformers.optimization import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 
@@ -23,7 +23,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--train_data", type=str, default="")
 parser.add_argument("--valid_data", type=str, default="data/even.dev")
 parser.add_argument("--max_seq_len", type=str, default="0:64,5:256", help="Either num or e.g. 0:32,5:64")  
-parser.add_argument("--model_path", type=str, default="microsoft/deberta-v3-base")
+parser.add_argument("--model_path", type=str, default="gpt2")
 parser.add_argument("--output_path", type=str, default="")
 parser.add_argument("--tokenizer", type=str, default=None)
 parser.add_argument("--batch_size", type=int, default=256, help="Number of examples per forward pass. Not affected by grad_acc.")
@@ -40,9 +40,6 @@ parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--weight_decay", type=float, default=0.1)
-parser.add_argument("--mlm_prob", type=float, default=0.15)
-parser.add_argument("--mask_replace_prob", type=float, default=0.8)
-parser.add_argument("--random_replace_prob", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--pretrained", action="store_true", help="Load pretrained model")
 parser.add_argument("--eval_only", action="store_true", help="Evaluate only")
@@ -57,30 +54,42 @@ def evaluate(model, tokenizer, dataloader, args):
     model.eval()
     correct = 0
     total = 0
-    avg_loss = 0
+    loss_sum = 0.0
+    n_batches = 0
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
             if len(batch["input_ids"]) == 0:
                 continue # NOTE: not sure why this happens in 100M case...
 
-            masked_batch = mask_batch(batch, tokenizer, mlm_prob=0.15, mask_replace_prob=0.8, random_replace_prob=0.1)
-            # split batch into grad_acc chunks
-            batches = split_batch(masked_batch, args)
+            # Causal LM: no masking. Labels = input_ids; the model shifts internally.
+            batches = split_batch(batch, args)
             for minibatch in batches:
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
                     outputs = model(**move_dict_to_cuda(minibatch))
-            
-                avg_loss += outputs.loss.item()
-                logits = outputs.logits
-                preds = logits.argmax(dim=-1)
 
-                labels = minibatch["labels"].to(device=logits.device, dtype=logits.dtype)
-                label_mask = labels != -100
-                correct += (preds[label_mask] == labels[label_mask]).sum().item()
-                total += preds[label_mask].numel()
+                loss_sum += outputs.loss.item()
+                n_batches += 1
+
+                # Next-token accuracy: position t predicts token t+1, so shift by one.
+                logits = outputs.logits                       # [B, T, V]
+                labels = minibatch["labels"].to(device=logits.device)
+                shift_logits = logits[:, :-1, :]
+                shift_labels = labels[:, 1:]
+                preds = shift_logits.argmax(dim=-1)
+
+                # -100 here marks PADDING (the ignore_index), not MLM-style masking.
+                # We exclude pad positions so accuracy is over real next-token targets.
+                pad_mask = shift_labels != -100
+                correct += (preds[pad_mask] == shift_labels[pad_mask]).sum().item()
+                total += pad_mask.sum().item()
 
     model.train()
-    return {'acc': 100 * correct / total, 'loss': avg_loss / (len(dataloader) * args.grad_acc)}
+    avg_loss = loss_sum / max(n_batches, 1)
+    return {
+        'acc': 100 * correct / max(total, 1),
+        'loss': avg_loss,
+        'ppl': math.exp(avg_loss) if avg_loss < 20 else float('inf'),
+    }
 
 
 def regroup_texts(args, max_seq_len):
@@ -117,29 +126,6 @@ def regroup_texts(args, max_seq_len):
     args.cur_max_seq_len = max_seq_len
 
     return train_dataloader, eval_dataloader
-
-def mask_batch(batch, tokenizer, mlm_prob=0.15, mask_replace_prob=0.8, random_replace_prob=0.1):
-    masked_batch = batch.copy()
-    for i in range(len(batch["input_ids"])):
-        enc = batch["input_ids"][i]
-        pad_mask = enc == tokenizer.pad_token_id
-        enc_mask_mask = (torch.rand(len(enc)) < mlm_prob) & ~pad_mask
-
-        rand = torch.rand(len(enc))
-        to_mask = (rand < mask_replace_prob) & enc_mask_mask
-        to_replace = (rand >= mask_replace_prob) & (rand < mask_replace_prob + random_replace_prob) & enc_mask_mask
-
-        randoms = torch.randint(0, tokenizer.vocab_size, (len(enc),))
-        enc[to_mask] = tokenizer.mask_token_id
-        enc[to_replace] = randoms[to_replace]
-
-        masked_batch["input_ids"][i] = enc
-
-        labels = batch["labels"][i]
-        labels[~enc_mask_mask] = -100
-        masked_batch["labels"][i] = labels
-
-    return masked_batch
 
 def split_batch(batch, args):
     minibatch_size = args.batch_size // args.grad_acc
@@ -237,17 +223,8 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     args.max_seq_len = args.max_seq_len[1:]
 
             for step, batch in enumerate(train_dataloader):
-                masked_batch = mask_batch(
-                    batch,
-                    tokenizer,
-                    mlm_prob=args.mlm_prob,
-                    mask_replace_prob=args.mask_replace_prob,
-                    random_replace_prob=args.random_replace_prob,
-                )
+                batches = split_batch(batch, args)
 
-                # split batch into grad_acc chunks
-                batches = split_batch(masked_batch, args)
-                
                 for minibatch in batches:
 
                     with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
@@ -309,12 +286,13 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 # ----- EVALUATION -----
                 if is_step("eval", global_step, args):
                     metrics = evaluate(model, tokenizer, eval_dataloader, args)
-                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f} -----", flush=True)
+                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}, PPL: {metrics['ppl']:.2f} -----", flush=True)
 
                     if args.wandb:
                         wandb.log({
                             "eval_acc": metrics["acc"],
-                            "eval_loss": metrics["loss"]
+                            "eval_loss": metrics["loss"],
+                            "eval_ppl": metrics["ppl"],
                         })
 
                 # ----- SAVING -----
@@ -362,30 +340,21 @@ def main():
 
     tokenizer = DebertaV2Tokenizer.from_pretrained(args.tokenizer, do_lower_case=args.lower)
 
-    # ---- Register code-switching control tokens ---- #
-    num_added = tokenizer.add_special_tokens({
-        'additional_special_tokens': ['[PREDICT_NL]', '[PREDICT_ZH]']
-    })
-    print(f"Added {num_added} code-switching control tokens to tokenizer")
-
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
 
-    config.vocab_size = len(tokenizer)   # reflects newly added tokens
-    config.max_position_embeddings = 1024
+    config.vocab_size = len(tokenizer)
     config.pad_token_id = tokenizer.pad_token_id
     config.bos_token_id = tokenizer.cls_token_id
-    config.cls_token_id = tokenizer.cls_token_id
     config.eos_token_id = tokenizer.sep_token_id
-    config.sep_token_id = tokenizer.sep_token_id
 
-    config.hidden_size = args.hidden_size
-    config.intermediate_size = args.intermediate_size
-    config.dropout = args.dropout
-    config.hidden_dropout_prob = args.dropout
+    config.n_positions = 1024
+    config.n_embd = args.hidden_size
+    config.n_inner = args.intermediate_size
+    config.resid_pdrop = args.dropout
+    config.embd_pdrop = args.dropout
+    config.attn_pdrop = args.dropout
 
-    model = AutoModelForMaskedLM.from_config(config, trust_remote_code=True)
-    # Resize embeddings to accommodate the new control tokens
-    model.resize_token_embeddings(len(tokenizer))
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of model parameters: {num_params}")

@@ -13,7 +13,6 @@ from preprocessing import tokenize, padding_collate_fn, group_texts
 from align_dictionary import load_all_dictionaries, sample_dict_batch
 from align_loss import align_loss_batch, compute_alignment_accuracy
 
-from bitsandbytes.optim import LAMB
 
 try:
     import wandb
@@ -84,7 +83,7 @@ def evaluate(model, tokenizer, dataloader, args):
             batches = split_batch(batch, args)
             for minibatch in batches:
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                    outputs = model(**move_dict_to_cuda(minibatch))
+                    outputs = model(**move_dict_to_cuda(minibatch), use_cache=False)
 
                 loss_sum += outputs.loss.item()
                 n_batches += 1
@@ -219,6 +218,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader, dict_pairs)
         from fvcore.nn import FlopCountAnalysis
 
     if args.lamb:
+        from bitsandbytes.optim import LAMB  # imported lazily so the script runs without bitsandbytes unless --lamb
         optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=args.weight_decay)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)

@@ -11,8 +11,6 @@ from datasets import load_dataset
 
 from preprocessing import tokenize, padding_collate_fn, group_texts
 
-from bitsandbytes.optim import LAMB
-
 try:
     import wandb
     wandb_available = True
@@ -50,7 +48,7 @@ parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
 
-def evaluate(model, tokenizer, dataloader, args):
+def evaluate(model, dataloader, args):
     model.eval()
     correct = 0
     total = 0
@@ -65,7 +63,7 @@ def evaluate(model, tokenizer, dataloader, args):
             batches = split_batch(batch, args)
             for minibatch in batches:
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                    outputs = model(**move_dict_to_cuda(minibatch))
+                    outputs = model(**move_dict_to_cuda(minibatch), use_cache=False)
 
                 loss_sum += outputs.loss.item()
                 n_batches += 1
@@ -77,8 +75,6 @@ def evaluate(model, tokenizer, dataloader, args):
                 shift_labels = labels[:, 1:]
                 preds = shift_logits.argmax(dim=-1)
 
-                # -100 here marks PADDING (the ignore_index), not MLM-style masking.
-                # We exclude pad positions so accuracy is over real next-token targets.
                 pad_mask = shift_labels != -100
                 correct += (preds[pad_mask] == shift_labels[pad_mask]).sum().item()
                 total += pad_mask.sum().item()
@@ -198,6 +194,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
 
     if args.lamb:
+        from bitsandbytes.optim import LAMB  # imported lazily so the script runs without bitsandbytes unless --lamb
         optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=args.weight_decay)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
@@ -285,7 +282,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
                 # ----- EVALUATION -----
                 if is_step("eval", global_step, args):
-                    metrics = evaluate(model, tokenizer, eval_dataloader, args)
+                    metrics = evaluate(model, eval_dataloader, args)
                     print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}, PPL: {metrics['ppl']:.2f} -----", flush=True)
 
                     if args.wandb:

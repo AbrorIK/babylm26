@@ -10,6 +10,7 @@ from transformers.optimization import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 
 from preprocessing import tokenize, padding_collate_fn, group_texts
+from soft_labels import build_soft_map, compile_tables, soft_label_loss
 
 try:
     import wandb
@@ -48,44 +49,41 @@ parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
 
+# ---- soft-label cross-lingual alignment ----
+parser.add_argument("--soft_label", action="store_true", help="Use dictionary soft-label alignment loss")
+parser.add_argument("--soft_eps", type=float, default=0.20, help="Probability mass moved to translations")
+parser.add_argument("--soft_max_trans", type=int, default=4, help="Max translations per source token (K)")
+parser.add_argument("--soft_dict_en_nl", type=str, default="data/dictionaries/en-nl.txt")
+parser.add_argument("--soft_dict_en_zh", type=str, default="data/dictionaries/en-zh.txt")
+
 def evaluate(model, dataloader, args):
     model.eval()
     correct = 0
     total = 0
-    loss_sum = 0.0
-    n_batches = 0
+    avg_loss = 0
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
             if len(batch["input_ids"]) == 0:
                 continue # NOTE: not sure why this happens in 100M case...
 
-            # Causal LM: no masking. Labels = input_ids; the model shifts internally.
             batches = split_batch(batch, args)
             for minibatch in batches:
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                    outputs = model(**move_dict_to_cuda(minibatch), use_cache=False)
+                    outputs = model(**move_dict_to_cuda(minibatch))
 
-                loss_sum += outputs.loss.item()
-                n_batches += 1
+                avg_loss += outputs.loss.item()
+                logits = outputs.logits
 
-                # Next-token accuracy: position t predicts token t+1, so shift by one.
-                logits = outputs.logits                       # [B, T, V]
-                labels = minibatch["labels"].to(device=logits.device)
-                shift_logits = logits[:, :-1, :]
-                shift_labels = labels[:, 1:]
-                preds = shift_logits.argmax(dim=-1)
+                # shift by one: position t predicts token t+1
+                preds = logits[:, :-1, :].argmax(dim=-1)
+                labels = minibatch["labels"][:, 1:].to(device=logits.device)
 
-                pad_mask = shift_labels != -100
-                correct += (preds[pad_mask] == shift_labels[pad_mask]).sum().item()
-                total += pad_mask.sum().item()
+                label_mask = labels != -100
+                correct += (preds[label_mask] == labels[label_mask]).sum().item()
+                total += preds[label_mask].numel()
 
     model.train()
-    avg_loss = loss_sum / max(n_batches, 1)
-    return {
-        'acc': 100 * correct / max(total, 1),
-        'loss': avg_loss,
-        'ppl': math.exp(avg_loss) if avg_loss < 20 else float('inf'),
-    }
+    return {'acc': 100 * correct / total, 'loss': avg_loss / (len(dataloader) * args.grad_acc)}
 
 
 def regroup_texts(args, max_seq_len):
@@ -237,11 +235,21 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
 
                         outputs = model(**move_dict_to_cuda(minibatch))
-                        loss = outputs.loss
-                        
-                        # Add z-loss
+
+                        # ----- main loss: soft-label alignment or standard CLM -----
                         logits = outputs.logits  # [B,T,V]
                         labels = minibatch["labels"].to(device=logits.device)
+                        if args.soft_label:
+                            loss = soft_label_loss(
+                                logits, labels,
+                                args.soft_true_weight,
+                                args.soft_trans_ids,
+                                args.soft_trans_wts,
+                            )
+                        else:
+                            loss = outputs.loss
+
+                        # Add z-loss
                         valid = labels.ne(-100)
                         z = torch.logsumexp(logits, dim=-1)  # [B,T]
                         z = z.masked_select(valid)
@@ -283,13 +291,12 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 # ----- EVALUATION -----
                 if is_step("eval", global_step, args):
                     metrics = evaluate(model, eval_dataloader, args)
-                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}, PPL: {metrics['ppl']:.2f} -----", flush=True)
+                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}", flush=True)
 
                     if args.wandb:
                         wandb.log({
                             "eval_acc": metrics["acc"],
                             "eval_loss": metrics["loss"],
-                            "eval_ppl": metrics["ppl"],
                         })
 
                 # ----- SAVING -----
@@ -302,7 +309,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 pbar.update(1)
                 global_step += 1
 
-    metrics = evaluate(model, tokenizer, eval_dataloader, args)
+    metrics = evaluate(model, eval_dataloader, args)
     print(f"Final eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}", flush=True)
 
     save_path = os.path.join(args.output_path, f"checkpoint-{args.total_steps}")
@@ -355,6 +362,15 @@ def main():
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of model parameters: {num_params}")
+
+    # Build soft-label alignment tables (once), indexed by token id.
+    if args.soft_label:
+        print("Building soft-label alignment tables...")
+        soft_map = build_soft_map(tokenizer, args.soft_dict_en_nl, args.soft_dict_en_zh)
+        args.soft_true_weight, args.soft_trans_ids, args.soft_trans_wts = compile_tables(
+            soft_map, len(tokenizer), eps=args.soft_eps, K=args.soft_max_trans, device="cuda:0"
+        )
+        print(f"Soft-label map: {len(soft_map)} source tokens, eps={args.soft_eps}, K={args.soft_max_trans}")
 
     dataset = load_dataset('text', data_files={'train': args.train_data, 'validation': args.valid_data})
 

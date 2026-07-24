@@ -59,6 +59,36 @@ def tokenize(examples, tokenizer, input_field):
         encoded['attention_mask'] += [attention_mask]
     return encoded
 
+def tokenize_tagged(examples, tokenizer, input_field):
+    """Tokenize '<lang>\t<text>' lines from data_prep/tagged_dataset.py.
+
+    Same as tokenize(), plus a fourth parallel field 'lang_ids' that marks the
+    language of every token: eng=1, nld=2, zho=3 (0 is reserved for padding).
+
+    lang_ids are per token (not per line) because group_texts later
+    concatenates all lines and re-chunks them, so one chunk can straddle a
+    language boundary. group_texts slices every key identically, which keeps
+    lang_ids aligned with input_ids. padding_collate_fn pads the extra key
+    with 0; those positions have labels == -100 and are masked from all losses.
+    """
+    lang2id = {"eng": 1, "nld": 2, "zho": 3}
+    encoded = {
+        'input_ids': [],
+        'attention_mask': [],
+        'labels': [],
+        'lang_ids': []}
+    for i in range(len(examples[input_field])):
+        # Split on the FIRST tab only: the text itself may contain tabs
+        # (e.g. CHILDES lines like '*MOT:\txxx ...').
+        lang, _, src = examples[input_field][i].partition("\t")
+        lang_id = lang2id.get(lang.strip(), 0)
+        src_tok = tokenizer.encode(src)
+        encoded['input_ids'] += [src_tok]
+        encoded['labels'] += [src_tok]
+        encoded['attention_mask'] += [[1] * len(src_tok)]
+        encoded['lang_ids'] += [[lang_id] * len(src_tok)]
+    return encoded
+
 def padding_collate_fn(batch, max_len=2048, skip_fields=[], add_labels=False):
     """ 
         Pads each list with zeros and concatenates by key.

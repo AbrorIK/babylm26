@@ -1,14 +1,18 @@
 # Core runtime
 torch>=2.1.0
-transformers>=4.40.0
+# Qwen3 architecture support (used only by data_prep/translate_vocab.py) needs >=4.51
+transformers==4.57.6
 datasets>=2.18.0
-sentencepiece>=0.1.99
+# tokenizer is trained and shipped as tokenizer.json (see tokenizer_training.py)
+tokenizers>=0.20
+sentencepiece>=0.1.99   # no longer used for training; kept for reading old models
 numpy>=1.23
 tqdm>=4.66
 nltk>=3.8
+opencc-python-reimplemented>=0.1.7
 
-# LAMB optimizer (only needed for --lamb). Limited to Linux where wheels are available.
-bitsandbytes>=0.41.1; platform_system == "Linux"
+huggingface_hub[cli]>=0.23.0
+accelerate>=0.30.0
 
 # Optional: experiment tracking (only if using --wandb)
 wandb>=0.16.0

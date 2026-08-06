@@ -16,6 +16,7 @@ from multihead_model import (
     MultiHeadGPT2LMHeadModel,
     head_divergence,
 )
+from prealign import load_word_groups, prealign
 
 try:
     import wandb
@@ -51,6 +52,16 @@ parser.add_argument("--lamb", action="store_true", help="LAMB optimization")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
+
+# ---- PreAlign: cross-lingual word alignment before pretraining ----
+parser.add_argument("--prealign_steps", type=int, default=0, help="0 disables PreAlign")
+parser.add_argument("--prealign_triplets", type=str, default="data/prealign_triplets.tsv")
+parser.add_argument("--prealign_alpha", type=float, default=0.1, help="Alignment loss weight")
+parser.add_argument("--prealign_lr", type=float, default=3e-4)
+parser.add_argument("--prealign_groups", type=int, default=64, help="Word groups per step")
+parser.add_argument("--prealign_tau", type=float, default=0.1, help="Contrastive temperature")
+parser.add_argument("--prealign_max_len", type=int, default=8, help="Max subwords per word")
+parser.add_argument("--prealign_log_every", type=int, default=50)
 
 
 def evaluate(model, dataloader, args):
@@ -421,6 +432,10 @@ def main():
         shuffle=False,
         collate_fn=padding_collate_fn,
     )
+
+    if args.prealign_steps > 0:
+        groups = load_word_groups(args.prealign_triplets)
+        model = prealign(model, tokenizer, groups, train_dataloader, args)
 
     train(args, model, tokenizer, train_dataloader, eval_dataloader)
 

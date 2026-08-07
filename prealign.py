@@ -15,6 +15,12 @@ aligning them would duplicate the embedding-layer term.
 import torch
 import torch.nn.functional as F
 
+try:
+    import wandb
+    wandb_available = True
+except ImportError:
+    wandb_available = False
+
 # Overridable so the loop can be dry-run on CPU; training always uses the GPU.
 DEVICE = "cuda:0"
 
@@ -180,7 +186,8 @@ def prealign(model, tokenizer, groups, dataloader, args):
         attention_mask = attention_mask.to(device)
         group_ids = group_ids.to(device)
 
-        lm_batch = {k: v.to(device) for k, v in next(lm_batches).items()}
+        minibatch = max(1, getattr(args, "batch_size", 32) // max(1, getattr(args, "grad_acc", 1)))
+        lm_batch = {k: v[:minibatch].to(device) for k, v in next(lm_batches).items()}
 
         with _autocast():
             # one forward pass serves both the loss and the collapse diagnostic
@@ -202,6 +209,14 @@ def prealign(model, tokenizer, groups, dataloader, args):
             if neg_sim > 0.9:
                 print("    WARNING: representations are collapsing "
                       "(all words alike) — lower --prealign_alpha", flush=True)
+
+            if getattr(args, "wandb", False) and wandb_available:
+                wandb.log({
+                    "prealign/align_loss": align.item(),
+                    "prealign/lm_loss": lm.item(),
+                    "prealign/neg_similarity": neg_sim,
+                    "prealign/step": step,
+                })
 
     # The heads were copied from wte at init, and PreAlign has since moved wte.
     # Refresh them so main training starts from the aligned embeddings.

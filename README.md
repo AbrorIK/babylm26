@@ -1,5 +1,36 @@
 # BabyLM26
 
+## Building the training mixture
+
+`build_dataset.py` samples a byte-premium-adjusted multilingual dataset from three monolingual corpora.
+English is sampled by word count; Dutch and Chinese are sampled by file size, scaled by their
+[Byte Premium](https://aclanthology.org/2024.sigul-1.1/) so that all three languages contribute equal content.
+
+### Usage
+
+```bash
+python data_prep/build_dataset.py \
+    --eng data/babylm-eng.txt \
+    --nld data/babylm-nld.txt \
+    --zho data/babylm-zho.txt \
+    --tagged
+```
+
+This produces `data/bb26_train.tsv` and `data/bb26_validation.tsv` with a 90/10 split,
+equal language ratios, and language tags (`eng\t<text>`) needed by the multi-head model.
+
+### Options
+
+| Flag          | Default                    | Description                                              |
+| ------------- | -------------------------- | -------------------------------------------------------- |
+| `--budget`    | `100000000`                | Total word budget (English-equivalent)                   |
+| `--ratio`     | `0.333,0.333,0.334`        | eng,nld,zho content shares (must sum to ≤ 1.0)           |
+| `--val-ratio` | `0.1`                      | Fraction held out for validation                         |
+| `--seed`      | `42`                       | Random seed for reproducibility                          |
+| `--tagged`    | off                        | Prefix lines with language tag (required for multi-head) |
+| `--out-train` | `data/bb26_train.tsv`      | Output training file                                     |
+| `--out-valid` | `data/bb26_validation.tsv` | Output validation file                                   |
+
 ## Training
 
 To train our hard_decay model, for example, run:

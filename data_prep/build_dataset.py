@@ -1,7 +1,7 @@
 import argparse
 import random
 
-BP = {"nld": 1.0516, "zho": 0.9894}
+BP = {"nld": 1.051606, "zho": 0.935966}
 
 parser = argparse.ArgumentParser(description="Build a byte-premium-adjusted multilingual mixture for BabyLM 2026.")
 parser.add_argument("--eng", required=True, help="path to English corpus (one sentence per line)")

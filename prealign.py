@@ -148,6 +148,29 @@ def negative_similarity(reps, group_ids):
         return sim[different].mean().item()
 
 
+def sample_alignment_loss(model, tokenizer, groups, n_groups, max_len,
+                          temperature, device):
+    """Draw a batch of word groups and return their alignment loss.
+
+    Used both by the PreAlign phase and, when enabled, by the main training
+    loop — the paper keeps sampling word pairs for the alignment loss during
+    language pretraining, otherwise the alignment established up front is
+    forgotten over the much longer pretraining run.
+    """
+    import random
+
+    sample = random.sample(groups, min(n_groups, len(groups)))
+    words, group_ids = flatten_groups(sample)
+    input_ids, attention_mask = encode_words(words, tokenizer, max_len)
+    return alignment_loss(
+        model,
+        input_ids.to(device),
+        attention_mask.to(device),
+        group_ids.to(device),
+        temperature,
+    )
+
+
 def _infinite(dataloader):
     """Yield LM batches forever; PreAlign needs far fewer than one epoch."""
     while True:
@@ -176,7 +199,11 @@ def prealign(model, tokenizer, groups, dataloader, args):
     n_groups = min(args.prealign_groups, len(groups))
 
     print(f"PreAlign: {args.prealign_steps} steps, {len(groups):,} word groups, "
-          f"{n_groups} per step, alpha={args.prealign_alpha}", flush=True)
+          f"{n_groups} per step, alpha={args.prealign_alpha}, "
+          f"tau={args.prealign_tau}", flush=True)
+
+    peak_neg_sim = 0.0
+    last_align = last_lm = last_neg_sim = float("nan")
 
     for step in range(args.prealign_steps):
         sample = random.sample(groups, n_groups)
@@ -203,6 +230,8 @@ def prealign(model, tokenizer, groups, dataloader, args):
 
         if step % args.prealign_log_every == 0 or step == args.prealign_steps - 1:
             neg_sim = negative_similarity(reps[-1], group_ids)
+            peak_neg_sim = max(peak_neg_sim, neg_sim)
+            last_align, last_lm, last_neg_sim = align.item(), lm.item(), neg_sim
             print(f"  prealign {step:>4}/{args.prealign_steps}  "
                   f"align {align.item():.4f}  lm {lm.item():.4f}  "
                   f"neg_sim {neg_sim:.3f}", flush=True)
@@ -224,5 +253,12 @@ def prealign(model, tokenizer, groups, dataloader, args):
         for head in model.heads:
             head.weight.copy_(model.transformer.wte.weight)
     print("PreAlign done; heads refreshed from aligned embeddings", flush=True)
+    print(f"PREALIGN SUMMARY  alpha={args.prealign_alpha}  tau={args.prealign_tau}  "
+          f"final_align={last_align:.4f}  final_lm={last_lm:.4f}  "
+          f"final_neg_sim={last_neg_sim:.3f}  peak_neg_sim={peak_neg_sim:.3f}",
+          flush=True)
+    if peak_neg_sim > 0.7:
+        print("  -> peak_neg_sim above 0.7: representations collapsed at some "
+              "point; try a lower --prealign_alpha", flush=True)
 
     return model

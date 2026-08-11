@@ -24,6 +24,14 @@ except ImportError:
 # Overridable so the loop can be dry-run on CPU; training always uses the GPU.
 DEVICE = "cuda:0"
 
+# Steps before which a high negative-similarity reading is expected and benign.
+# A randomly initialised LM first learns the unigram distribution ("emit frequent
+# tokens regardless of context"), which drives every hidden state toward the same
+# direction. Measured on this setup, neg_sim peaks near 0.98 around step 50 at
+# EVERY alpha from 0.01 to 0.3 — so the spike tracks LM warm-up, not the
+# contrastive loss. It decays once representations differentiate.
+EARLY_PHASE_STEPS = 200
+
 
 def _autocast():
     if DEVICE.startswith("cuda"):
@@ -135,9 +143,11 @@ def alignment_loss(model, input_ids, attention_mask, group_ids, temperature=0.1)
 def negative_similarity(reps, group_ids):
     """Mean cosine similarity between words in DIFFERENT groups.
 
-    The collapse detector. Contrastive loss has a trivial solution where every
-    word maps to the same vector; if this climbs toward 1.0 the model is taking
-    it and the alignment weight is too high.
+    Reads high (~0.98) during the first ~100 steps for reasons that have nothing
+    to do with alignment — see EARLY_PHASE_STEPS. Only a value that stays high
+    after the LM has warmed up indicates representations genuinely collapsing
+    onto one vector. Note that in practice a HIGHER alignment weight lowers this,
+    because the contrastive term actively pushes unrelated words apart.
     """
     with torch.no_grad():
         z = F.normalize(reps.float(), dim=-1)
@@ -202,7 +212,8 @@ def prealign(model, tokenizer, groups, dataloader, args):
           f"{n_groups} per step, alpha={args.prealign_alpha}, "
           f"tau={args.prealign_tau}", flush=True)
 
-    peak_neg_sim = 0.0
+    peak_neg_sim = 0.0          # includes the benign LM warm-up spike
+    late_neg_sim = 0.0          # after warm-up: the meaningful reading
     last_align = last_lm = last_neg_sim = float("nan")
 
     for step in range(args.prealign_steps):
@@ -231,13 +242,15 @@ def prealign(model, tokenizer, groups, dataloader, args):
         if step % args.prealign_log_every == 0 or step == args.prealign_steps - 1:
             neg_sim = negative_similarity(reps[-1], group_ids)
             peak_neg_sim = max(peak_neg_sim, neg_sim)
+            if step >= EARLY_PHASE_STEPS:
+                late_neg_sim = max(late_neg_sim, neg_sim)
             last_align, last_lm, last_neg_sim = align.item(), lm.item(), neg_sim
             print(f"  prealign {step:>4}/{args.prealign_steps}  "
                   f"align {align.item():.4f}  lm {lm.item():.4f}  "
                   f"neg_sim {neg_sim:.3f}", flush=True)
-            if neg_sim > 0.9:
-                print("    WARNING: representations are collapsing "
-                      "(all words alike) — lower --prealign_alpha", flush=True)
+            if step >= EARLY_PHASE_STEPS and neg_sim > 0.85:
+                print("    WARNING: unrelated words still near-identical after "
+                      "LM warm-up — alignment is not separating them", flush=True)
 
             if getattr(args, "wandb", False) and wandb_available:
                 wandb.log({
@@ -255,10 +268,14 @@ def prealign(model, tokenizer, groups, dataloader, args):
     print("PreAlign done; heads refreshed from aligned embeddings", flush=True)
     print(f"PREALIGN SUMMARY  alpha={args.prealign_alpha}  tau={args.prealign_tau}  "
           f"final_align={last_align:.4f}  final_lm={last_lm:.4f}  "
-          f"final_neg_sim={last_neg_sim:.3f}  peak_neg_sim={peak_neg_sim:.3f}",
+          f"final_neg_sim={last_neg_sim:.3f}  late_neg_sim={late_neg_sim:.3f}  "
+          f"peak_neg_sim={peak_neg_sim:.3f}", flush=True)
+    print("  compare runs on final_align (lower is better); watch final_lm for "
+          "the point where alignment starts costing language modelling.",
           flush=True)
-    if peak_neg_sim > 0.7:
-        print("  -> peak_neg_sim above 0.7: representations collapsed at some "
-              "point; try a lower --prealign_alpha", flush=True)
+    if late_neg_sim > 0.85:
+        print(f"  -> late_neg_sim {late_neg_sim:.3f}: unrelated words stayed "
+              "near-identical past warm-up. A HIGHER alpha usually reduces this.",
+              flush=True)
 
     return model

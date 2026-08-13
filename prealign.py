@@ -1,19 +1,28 @@
 """
-PreAlign: cross-lingual word alignment before language pretraining.
+PreAlign: before training the language model, briefly train the model so that
+translations of the same word (e.g. "cat", "kat", "猫") end up with similar
+internal representations. This shapes the shared trunk before the LM objective
+pushes languages apart.
 
-A randomly initialised model is trained briefly so that translations land close
-together in representation space, then normal CLM training proceeds. The point
-is to shape the shared trunk before the LM objective carves out separate
-per-language regions.
-
-Only the trunk is aligned — the embedding layer and the transformer layers.
-The language heads are left alone: they are meant to diverge, and at PreAlign
-time all three are still identical copies of the embedding table anyway, so
-aligning them would duplicate the embedding-layer term.
+Only the trunk (embeddings + transformer layers) is aligned.
+The language heads are left alone.
 """
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import random
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
+from torch.utils.data import DataLoader
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+    from multihead_model import MultiHeadGPT2LMHeadModel
 
 try:
     import wandb
@@ -21,28 +30,28 @@ try:
 except ImportError:
     wandb_available = False
 
-# Overridable so the loop can be dry-run on CPU; training always uses the GPU.
-DEVICE = "cuda:0"
+# A group of translations of the same concept, e.g. ["cat", "kat", "猫"].
+WordGroup = list[str]
+# A standard HuggingFace batch: {"input_ids": Tensor, "attention_mask": Tensor, "labels": Tensor}.
+LMBatch = dict[str, Tensor]
 
-# Steps before which a high negative-similarity reading is expected and benign.
-# A randomly initialised LM first learns the unigram distribution ("emit frequent
-# tokens regardless of context"), which drives every hidden state toward the same
-# direction. Measured on this setup, neg_sim peaks near 0.98 around step 50 at
-# EVERY alpha from 0.01 to 0.3 — so the spike tracks LM warm-up, not the
-# contrastive loss. It decays once representations differentiate.
-EARLY_PHASE_STEPS = 200
+# Which device to run on. Overridden to "cpu" for testing.
+DEVICE: str = "cuda:0"
 
 
-def _autocast():
+def _autocast() -> contextlib.AbstractContextManager[None]:
+    """Use half-precision (bfloat16) on GPU for speed. Do nothing on CPU."""
     if DEVICE.startswith("cuda"):
         return torch.autocast(dtype=torch.bfloat16, device_type="cuda:0")
-    import contextlib
     return contextlib.nullcontext()
 
 
-def load_word_groups(path):
-    """Read ``eng \t nld \t zho`` triplets into groups of translations."""
-    groups = []
+def load_word_groups(path: str) -> list[WordGroup]:
+    """Read a TSV file of translations. Each line is "eng\\tnld\\tzho".
+
+    Returns e.g. [["cat", "kat", "猫"], ["dog", "hond", "狗"], ...].
+    """
+    groups: list[WordGroup] = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             parts = [p.strip() for p in line.rstrip("\n").split("\t")]
@@ -51,124 +60,211 @@ def load_word_groups(path):
     return groups
 
 
-def flatten_groups(groups):
-    """[["cat","kat","猫"], ...] -> (words, group_ids) with one entry per word."""
-    words, group_ids = [], []
-    for gid, group in enumerate(groups):
-        for word in group:
+def flatten_groups(groups: list[WordGroup]) -> tuple[list[str], Tensor]:
+    """Unnest translation groups into a flat word list + a group label per word.
+
+    Example:
+        Input:  [["cat", "kat", "猫"], ["dog", "hond", "狗"]]
+        Output: words    = ["cat", "kat", "猫", "dog", "hond", "狗"]
+                group_ids = tensor([0, 0, 0, 1, 1, 1])
+
+    Returns (words, group_ids).
+        words:     list of N strings
+        group_ids: [N] — integer saying which group each word belongs to
+    """
+    words: list[str] = []
+    group_ids: list[int] = []
+    for gid, group in enumerate(groups):       # gid = 0, 1, 2, ...
+        for word in group:                     # 3 words per group
             words.append(word)
             group_ids.append(gid)
-    return words, torch.tensor(group_ids)
+    return words, torch.tensor(group_ids)      # group_ids shape: [N]
 
 
-def encode_words(words, tokenizer, max_len=8):
-    """Tokenize words into one padded batch.
+def encode_words(
+    words: list[str],
+    tokenizer: PreTrainedTokenizerBase,
+    max_len: int = 8,
+) -> tuple[Tensor, Tensor]:
+    """Convert words to token IDs and pad them to equal length.
 
-    Words may be multiple subwords — they get mean-pooled later — so there is
-    no single-token requirement and no dependence on tokenizer segmentation.
+    A word like "unbelievable" may become multiple subword tokens [348, 12, 9921].
+    All words are padded to the length of the longest one.
+
+    Returns (input_ids, attention_mask).
+        input_ids:      [N, L]  — token numbers, 0 = padding
+        attention_mask: [N, L]  — 1 = real token, 0 = padding
+        where N = number of words, L = length of longest word in subwords
     """
-    sequences = []
+    sequences: list[list[int]] = []
     for word in words:
         ids = tokenizer.encode(word, add_special_tokens=False)[:max_len]
         sequences.append(ids or [tokenizer.unk_token_id])
 
     longest = max(len(s) for s in sequences)
+    # input_ids:      [N, longest] filled with 0s
     input_ids = torch.zeros(len(sequences), longest, dtype=torch.long)
+    # attention_mask: [N, longest] filled with 0s
     attention_mask = torch.zeros(len(sequences), longest, dtype=torch.long)
     for i, ids in enumerate(sequences):
-        input_ids[i, :len(ids)] = torch.tensor(ids)
-        attention_mask[i, :len(ids)] = 1
+        input_ids[i, :len(ids)] = torch.tensor(ids)       # fill real tokens
+        attention_mask[i, :len(ids)] = 1                   # mark them as real
     return input_ids, attention_mask
 
 
-def word_reps(model, input_ids, attention_mask):
-    """One forward pass -> a mean-pooled vector per word, per layer.
+def word_reps(
+    model: MultiHeadGPT2LMHeadModel,
+    input_ids: Tensor,        # [N, L]
+    attention_mask: Tensor,   # [N, L]
+) -> list[Tensor]:
+    """Run words through the transformer trunk and get one vector per word per layer.
 
-    Returns a list of L+1 tensors of shape [num_words, d]: the embedding layer
-    followed by each transformer layer. Going through model.transformer skips
-    the language heads entirely, so no lang_ids are needed.
+    Words that span multiple subwords are mean-pooled into a single vector.
+    Skips the language heads entirely — only uses the shared trunk.
+
+    Returns a list of (num_layers + 1) tensors, each of shape [N, D].
+        Index 0 = embedding layer output
+        Index 1..12 = transformer layer outputs
+        D = hidden dimension (e.g. 768)
     """
     outputs = model.transformer(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
+        input_ids=input_ids,              # [N, L]
+        attention_mask=attention_mask,     # [N, L]
         output_hidden_states=True,
     )
-    mask = attention_mask.unsqueeze(-1)
-    reps = []
-    for hidden in outputs.hidden_states:
-        m = mask.to(hidden.dtype)
-        reps.append((hidden * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-6))
-    return reps
+    # outputs.hidden_states is a tuple of (num_layers+1) tensors, each [N, L, D]
+
+    # mask: [N, L] -> [N, L, 1]  (add a dimension so it can multiply with [N, L, D])
+    mask = attention_mask.unsqueeze(-1)    # [N, L, 1]
+
+    reps: list[Tensor] = []
+    for hidden in outputs.hidden_states:   # each hidden: [N, L, D]
+        m = mask.to(hidden.dtype)          # [N, L, 1] — same dtype as hidden
+
+        # Mean-pool: zero out padding positions, sum across subwords, divide by count
+        # hidden * m:          [N, L, D] * [N, L, 1] -> [N, L, D]  (broadcast on D)
+        #   padding positions become 0
+        # .sum(dim=1):         [N, L, D] -> [N, D]   (sum over the L subword positions)
+        # m.sum(dim=1):        [N, L, 1] -> [N, 1]   (count of real tokens per word)
+        # .clamp(min=1e-6):    avoid division by zero
+        # division:            [N, D] / [N, 1] -> [N, D]  (broadcast on D)
+        pooled = (hidden * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-6)  # [N, D]
+        reps.append(pooled)
+
+    return reps  # list of (num_layers+1) tensors, each [N, D]
 
 
-def supcon_loss(reps, group_ids, temperature=0.1):
-    """Supervised contrastive loss: words in the same group are positives.
+def supcon_loss(reps: Tensor, group_ids: Tensor, temperature: float = 0.1) -> Tensor:
+    """Contrastive loss: push translations together, push unrelated words apart.
 
-    Every word is an anchor; its translations are the positives and all other
-    words in the batch are negatives. Self-similarity is masked out — it is
-    always 1.0 and, at temperature 0.1, exp(1/0.1) would dominate the
-    denominator and flatten the loss.
+    For each word (the "anchor"), its translations are "positives" and everything
+    else is "negatives". The loss is low when translations are more similar to
+    each other than to unrelated words.
+
+    Args:
+        reps:        [N, D] — one vector per word
+        group_ids:   [N]    — which translation group each word belongs to
+        temperature: scalar — sharpness. 0.1 means similarities in [-1,1] get
+                     stretched to [-10,10] before softmax, making the loss very
+                     sensitive to small differences.
+
+    Returns a scalar loss tensor.
     """
-    # float32 for the similarity maths: normalize and logsumexp lose too much
-    # in bf16, and these tensors are small ([words, d]) so it costs nothing.
-    z = F.normalize(reps.float(), dim=-1)
-    sim = (z @ z.t()) / temperature
+    # ---- Step 1: normalize vectors to unit length ----
+    # After this, dot product = cosine similarity (range [-1, 1])
+    z = F.normalize(reps.float(), dim=-1)           # [N, D]
 
-    n = z.size(0)
-    eye = torch.eye(n, dtype=torch.bool, device=z.device)
-    sim = sim.masked_fill(eye, float("-inf"))
+    # ---- Step 2: compute all pairwise similarities, scaled by temperature ----
+    # z @ z.t():  [N, D] × [D, N] -> [N, N]
+    # Each cell (i,j) = cosine similarity between word i and word j
+    # Dividing by 0.1 stretches the range from [-1,1] to [-10,10]
+    sim = (z @ z.t()) / temperature                 # [N, N]
 
-    positives = (group_ids[:, None] == group_ids[None, :]) & ~eye
-    n_positives = positives.sum()
+    # ---- Step 3: mask out self-similarity (the diagonal) ----
+    # A word compared to itself always scores 1.0 / 0.1 = 10.0
+    # That would dominate the softmax, so we set it to -infinity
+    n = z.size(0)                                   # N
+    eye = torch.eye(n, dtype=torch.bool, device=z.device)  # [N, N] diagonal = True
+    sim = sim.masked_fill(eye, float("-inf"))       # [N, N] diagonal = -inf
+
+    # ---- Step 4: find which pairs are translations (positives) ----
+    # group_ids[:, None]: [N] -> [N, 1]  (column vector)
+    # group_ids[None, :]: [N] -> [1, N]  (row vector)
+    # comparison:         [N, 1] == [1, N] -> [N, N]  (broadcast: True where same group)
+    # & ~eye: exclude self-pairs
+    positives = (group_ids[:, None] == group_ids[None, :]) & ~eye  # [N, N] bool
+
+    n_positives = positives.sum()                   # scalar: total number of positive pairs
     if n_positives == 0:
-        return reps.sum() * 0.0
+        return reps.sum() * 0.0                     # no positives -> zero loss (with grad)
 
-    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-    # Index rather than multiply by the mask: the masked diagonal is -inf, and
-    # 0 * -inf is NaN.
-    return -log_prob[positives].sum() / n_positives
+    # ---- Step 5: compute log-softmax for each row ----
+    # For each anchor word i, this computes:
+    #   log_prob[i,j] = sim[i,j] - log(sum_over_k(exp(sim[i,k])))
+    # This is the log probability that word i "picks" word j out of all others
+    # logsumexp(sim, dim=1): [N, N] -> [N, 1]  (one normalizer per row)
+    log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)  # [N, N]
+
+    # ---- Step 6: average the log-prob of the positive pairs ----
+    # log_prob[positives]: select only the positive entries -> [n_positives]
+    # Negate because we want to MAXIMIZE log_prob (minimizing negative log_prob)
+    return -log_prob[positives].sum() / n_positives  # scalar
 
 
-def alignment_loss(model, input_ids, attention_mask, group_ids, temperature=0.1):
-    """Contrastive loss averaged over the embedding and transformer layers.
+def alignment_loss(
+    model: MultiHeadGPT2LMHeadModel,
+    input_ids: Tensor,        # [N, L]
+    attention_mask: Tensor,   # [N, L]
+    group_ids: Tensor,        # [N]
+    temperature: float = 0.1,
+) -> Tensor:
+    """Compute contrastive loss at every layer, then average across layers.
 
-    Averaging rather than summing keeps the scale independent of depth, so the
-    alignment weight means the same thing for a 6- and a 12-layer model.
+    Averaging (instead of summing) makes the loss scale independent of model
+    depth — so alpha means the same thing for a 6-layer and 12-layer model.
+
+    Returns a scalar loss tensor.
     """
-    reps = word_reps(model, input_ids, attention_mask)
-    losses = [supcon_loss(r, group_ids, temperature) for r in reps]
-    return torch.stack(losses).mean()
+    reps = word_reps(model, input_ids, attention_mask)  # list of (L+1) × [N, D]
+    losses = [supcon_loss(r, group_ids, temperature) for r in reps]  # list of (L+1) scalars
+    return torch.stack(losses).mean()                   # scalar: average across layers
 
 
-def negative_similarity(reps, group_ids):
-    """Mean cosine similarity between words in DIFFERENT groups.
+def negative_similarity(reps: Tensor, group_ids: Tensor) -> float:
+    """How similar are unrelated words? (0 for different words => good, 1 for identical words => bad)
 
-    Reads high (~0.98) during the first ~100 steps for reasons that have nothing
-    to do with alignment — see EARLY_PHASE_STEPS. Only a value that stays high
-    after the LM has warmed up indicates representations genuinely collapsing
-    onto one vector. Note that in practice a HIGHER alignment weight lowers this,
-    because the contrastive term actively pushes unrelated words apart.
+    Computes average cosine similarity between all word pairs from different groups.
+
+    Args:
+        reps:      [N, D] — word vectors from one layer
+        group_ids: [N]    — group labels
+
+    Returns a float between 0 and 1.
     """
     with torch.no_grad():
-        z = F.normalize(reps.float(), dim=-1)
-        sim = z @ z.t()
-        different = group_ids[:, None] != group_ids[None, :]
+        z = F.normalize(reps.float(), dim=-1)          # [N, D]
+        sim = z @ z.t()                                # [N, N] cosine similarities
+        # different: [N, 1] != [1, N] -> [N, N] (True where words are from different groups)
+        different = group_ids[:, None] != group_ids[None, :]  # [N, N] bool
         if not different.any():
             return 0.0
-        return sim[different].mean().item()
+        return float(sim[different].mean().item())     # average of off-group similarities
 
 
-def sample_alignment_loss(model, tokenizer, groups, n_groups, max_len,
-                          temperature, device):
-    """Draw a batch of word groups and return their alignment loss.
+def sample_alignment_loss(
+    model: MultiHeadGPT2LMHeadModel,
+    tokenizer: PreTrainedTokenizerBase,
+    groups: list[WordGroup],
+    n_groups: int,
+    max_len: int,
+    temperature: float,
+    device: str,
+) -> Tensor:
+    """Pick random word groups and compute their alignment loss. One-liner
+    used by both PreAlign and (optionally) the main training loop.
 
-    Used both by the PreAlign phase and, when enabled, by the main training
-    loop — the paper keeps sampling word pairs for the alignment loss during
-    language pretraining, otherwise the alignment established up front is
-    forgotten over the much longer pretraining run.
+    Returns a scalar loss tensor.
     """
-    import random
-
     sample = random.sample(groups, min(n_groups, len(groups)))
     words, group_ids = flatten_groups(sample)
     input_ids, attention_mask = encode_words(words, tokenizer, max_len)
@@ -181,23 +277,26 @@ def sample_alignment_loss(model, tokenizer, groups, n_groups, max_len,
     )
 
 
-def _infinite(dataloader):
-    """Yield LM batches forever; PreAlign needs far fewer than one epoch."""
-    while True:
-        for batch in dataloader:
-            yield batch
+def prealign(
+    model: MultiHeadGPT2LMHeadModel,
+    tokenizer: PreTrainedTokenizerBase,
+    groups: list[WordGroup],
+    dataloader: DataLoader[LMBatch],
+    args: argparse.Namespace,
+) -> MultiHeadGPT2LMHeadModel:
+    """Run 500 steps of alignment + language modeling, then return the model.
 
+    Each step:
+      1. Sample 64 word groups (192 words) and compute contrastive alignment loss
+      2. Take one batch of normal text and compute next-word-prediction loss
+      3. Combine: loss = alpha * align + lm
+      4. Update the model
 
-def prealign(model, tokenizer, groups, dataloader, args):
-    """Align translations in the trunk before language pretraining starts.
+    After all steps, copy the updated embedding table into the language heads.
 
-    Each step draws a batch of word groups for the contrastive loss and one
-    ordinary LM batch. The LM term is what stops the contrastive loss taking
-    its trivial solution of mapping every word to the same vector.
+    Returns the model with aligned embeddings.
     """
-    import random
-
-    device = DEVICE
+    device: str = DEVICE
     model.train()
     if device.startswith("cuda"):
         model = model.to(dtype=torch.bfloat16, device=device)
@@ -205,52 +304,88 @@ def prealign(model, tokenizer, groups, dataloader, args):
         model = model.to(device=device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.prealign_lr)
-    lm_batches = _infinite(dataloader)
-    n_groups = min(args.prealign_groups, len(groups))
+    n_groups: int = min(args.prealign_groups, len(groups))
 
-    print(f"PreAlign: {args.prealign_steps} steps, {len(groups):,} word groups, "
-          f"{n_groups} per step, alpha={args.prealign_alpha}, "
+    # ---- Create an iterator over the dataloader ----
+    # We only need ~500 batches out of millions, so we just grab an iterator
+    # and pull from it. If the dataloader runs out (unlikely), we make a new one.
+    lm_iter: Iterator[LMBatch] = iter(dataloader)
+
+    print(f"PreAlign: {args.prealign_steps} steps, "
+          f"{len(groups):,} word groups, "
+          f"{n_groups} per step, "
+          f"alpha={args.prealign_alpha}, "
           f"tau={args.prealign_tau}", flush=True)
 
-    peak_neg_sim = 0.0          # includes the benign LM warm-up spike
-    late_neg_sim = 0.0          # after warm-up: the meaningful reading
-    last_align = last_lm = last_neg_sim = float("nan")
+    last_align: float = float("nan")
+    last_lm: float = float("nan")
+    last_neg_sim: float = float("nan")
 
     for step in range(args.prealign_steps):
-        sample = random.sample(groups, n_groups)
+
+        # ==== ALIGNMENT BATCH ====
+        sample = random.sample(groups, n_groups) # Sample 64 random word groups -> 192 words (64 groups × 3 languages)
         words, group_ids = flatten_groups(sample)
+        # words:     list of 192 strings
+        # group_ids: [192]
+
         input_ids, attention_mask = encode_words(words, tokenizer, args.prealign_max_len)
+        # input_ids:      [192, L]  where L = longest word in subwords
+        # attention_mask: [192, L]
+
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
         group_ids = group_ids.to(device)
 
-        minibatch = max(1, getattr(args, "batch_size", 32) // max(1, getattr(args, "grad_acc", 1)))
-        lm_batch = {k: v[:minibatch].to(device) for k, v in next(lm_batches).items()}
+        # ==== LANGUAGE MODELING BATCH ====
+        minibatch: int = max(1, getattr(args, "batch_size", 32) //
+                                max(1, getattr(args, "grad_acc", 1)))
 
+        try:
+            raw_batch = next(lm_iter)
+        except StopIteration:
+            lm_iter = iter(dataloader)
+            raw_batch = next(lm_iter)
+
+        lm_batch: LMBatch = {k: v[:minibatch].to(device) for k, v in raw_batch.items()}
+        # lm_batch["input_ids"]:      [B, S]  where B = minibatch, S = sequence length
+        # lm_batch["attention_mask"]: [B, S]
+        # lm_batch["labels"]:         [B, S]
+
+        # ==== FORWARD PASS ====
         with _autocast():
-            # one forward pass serves both the loss and the collapse diagnostic
             reps = word_reps(model, input_ids, attention_mask)
-            align = torch.stack([supcon_loss(r, group_ids, args.prealign_tau) for r in reps]).mean()
+            # reps: list of 13 tensors, each [192, D] where D = hidden dim (e.g. 768)
+            #   reps[0]  = embedding layer output
+            #   reps[1]  = transformer layer 1 output
+            #   ...
+            #   reps[12] = transformer layer 12 output
+
+            align = torch.stack(
+                [supcon_loss(r, group_ids, args.prealign_tau) for r in reps]
+            ).mean()
+            # supcon_loss returns a scalar for each of the 13 layers
+            # torch.stack makes them into a [13] tensor
+            # .mean() averages them into one scalar
+
             lm = model(**lm_batch).loss
+
             loss = args.prealign_alpha * align + lm
 
+        # ==== BACKWARD PASS + UPDATE ====
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         optimizer.zero_grad()
 
-        if step % args.prealign_log_every == 0 or step == args.prealign_steps - 1:
-            neg_sim = negative_similarity(reps[-1], group_ids)
-            peak_neg_sim = max(peak_neg_sim, neg_sim)
-            if step >= EARLY_PHASE_STEPS:
-                late_neg_sim = max(late_neg_sim, neg_sim)
+        # ==== LOGGING (every 100 steps + last step) ====
+        if step % 100 == 0 or step == args.prealign_steps - 1:
+            neg_sim = negative_similarity(reps[-1], group_ids) # float in [0, 1] — how similar unrelated words are
+
             last_align, last_lm, last_neg_sim = align.item(), lm.item(), neg_sim
+
             print(f"  prealign {step:>4}/{args.prealign_steps}  "
                   f"align {align.item():.4f}  lm {lm.item():.4f}  "
                   f"neg_sim {neg_sim:.3f}", flush=True)
-            if step >= EARLY_PHASE_STEPS and neg_sim > 0.85:
-                print("    WARNING: unrelated words still near-identical after "
-                      "LM warm-up — alignment is not separating them", flush=True)
 
             if getattr(args, "wandb", False) and wandb_available:
                 wandb.log({
@@ -260,22 +395,23 @@ def prealign(model, tokenizer, groups, dataloader, args):
                     "prealign/step": step,
                 })
 
-    # The heads were copied from wte at init, and PreAlign has since moved wte.
-    # Refresh them so main training starts from the aligned embeddings.
+    # ==== REFRESH LANGUAGE HEADS ====
+    # The 3 language heads started as copies of the embedding table (wte).
+    # PreAlign has changed wte. Copy the updated wte into all heads so
+    # main training starts from the aligned embeddings.
     with torch.no_grad():
         for head in model.heads:
+            # head.weight: [vocab_size, D]
+            # model.transformer.wte.weight: [vocab_size, D]
             head.weight.copy_(model.transformer.wte.weight)
+
     print("PreAlign done; heads refreshed from aligned embeddings", flush=True)
-    print(f"PREALIGN SUMMARY  alpha={args.prealign_alpha}  tau={args.prealign_tau}  "
-          f"final_align={last_align:.4f}  final_lm={last_lm:.4f}  "
-          f"final_neg_sim={last_neg_sim:.3f}  late_neg_sim={late_neg_sim:.3f}  "
-          f"peak_neg_sim={peak_neg_sim:.3f}", flush=True)
-    print("  compare runs on final_align (lower is better); watch final_lm for "
-          "the point where alignment starts costing language modelling.",
-          flush=True)
-    if late_neg_sim > 0.85:
-        print(f"  -> late_neg_sim {late_neg_sim:.3f}: unrelated words stayed "
-              "near-identical past warm-up. A HIGHER alpha usually reduces this.",
-              flush=True)
+
+    print(f"PREALIGN SUMMARY  "
+          f"alpha={args.prealign_alpha}  "
+          f"tau={args.prealign_tau}  "
+          f"final_align={last_align:.4f}  "
+          f"final_lm={last_lm:.4f}  "
+          f"final_neg_sim={last_neg_sim:.3f}", flush=True)
 
     return model

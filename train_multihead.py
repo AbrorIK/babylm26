@@ -36,11 +36,6 @@ parser.add_argument("--grad_acc", type=int, default=1, help="Split the batch siz
 parser.add_argument("--lr", type=float, default=0.007)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--cpus", type=int, default=10)
-parser.add_argument("--logging_steps", type=int, default=100)
-parser.add_argument("--eval_steps", type=int, default=1000)
-parser.add_argument("--save_steps", type=int, default=1000)
-parser.add_argument("--all_checkpoints", action="store_true", help="Save and evaluate model every 1/10/100M tokens, \
-                    per challenge stipulations. Overrides eval_steps and save_steps.")
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
@@ -48,7 +43,6 @@ parser.add_argument("--weight_decay", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--debug", action="store_true", help="Activates debug mode")
 parser.add_argument("--wandb", action="store_true", help="Report to wandb")
-parser.add_argument("--lamb", action="store_true", help="LAMB optimization")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
@@ -61,14 +55,10 @@ parser.add_argument("--prealign_lr", type=float, default=3e-4)
 parser.add_argument("--prealign_groups", type=int, default=64, help="Word groups per step")
 parser.add_argument("--prealign_tau", type=float, default=0.1, help="Contrastive temperature")
 parser.add_argument("--prealign_max_len", type=int, default=8, help="Max subwords per word")
-parser.add_argument("--prealign_log_every", type=int, default=50)
 parser.add_argument("--prealign_only", action="store_true",
                     help="Run PreAlign then exit — for sweeping alpha cheaply")
 
 # ---- keep aligning during main training ----
-# The paper does not stop after the PreAlign phase: it keeps sampling word pairs
-# for the alignment loss throughout language pretraining, because alignment
-# established up front is otherwise forgotten over the much longer run.
 parser.add_argument("--align_lambda", type=float, default=0.0,
                     help="Alignment loss weight during main training (0 = off)")
 parser.add_argument("--align_every", type=int, default=1,
@@ -79,30 +69,57 @@ def evaluate(model, dataloader, args):
     model.eval()
     correct = 0
     total = 0
-    avg_loss = 0
+    loss_sum = 0.0
+    n_batches = 0
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
+            # batch["input_ids"]:      [B, T]
+            # batch["attention_mask"]: [B, T]
+            # batch["labels"]:         [B, T]
+            # batch["lang_ids"]:       [B, T]
+
             if len(batch["input_ids"]) == 0:
                 continue
 
+            # split_batch divides B into smaller chunks of size B' = B // grad_acc
             batches = split_batch(batch, args)
             for minibatch in batches:
+                # minibatch["input_ids"]:      [B', T]
+                # minibatch["attention_mask"]: [B', T]
+                # minibatch["labels"]:         [B', T]
+
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                    outputs = model(**move_dict_to_cuda(minibatch))
+                    outputs = model(**move_dict_to_cuda(minibatch), use_cache=False)
+                    # outputs.loss:   scalar
+                    # outputs.logits: [B', T, V]
 
-                avg_loss += outputs.loss.item()
-                logits = outputs.logits
+                loss_sum += outputs.loss.item()
+                n_batches += 1
 
-                preds = logits[:, :-1, :].argmax(dim=-1)
-                labels = minibatch["labels"][:, 1:].to(device=logits.device)
+                logits = outputs.logits                    # [B', T, V]
+                labels = minibatch["labels"].to(device=logits.device)  # [B', T]
 
-                label_mask = labels != -100
-                correct += (preds[label_mask] == labels[label_mask]).sum().item()
-                total += preds[label_mask].numel()
+                shift_logits = logits[:, :-1, :]           # [B', T-1, V]  drop last position
+                shift_labels = labels[:, 1:]               # [B', T-1]     drop first position
+                # Now shift_logits[b, t, :] is the prediction for shift_labels[b, t]
+
+                preds = shift_logits.argmax(dim=-1)        # [B', T-1]  index of highest-scoring token
+
+                pad_mask = shift_labels != -100            # [B', T-1]  bool: True = real, False = padding
+
+                # preds[pad_mask]:        [num_real_tokens]  (1D, only real positions)
+                # shift_labels[pad_mask]: [num_real_tokens]  (1D, same positions)
+                # == comparison:          [num_real_tokens]  bool
+                # .sum():                 scalar             count of correct predictions
+                correct += (preds[pad_mask] == shift_labels[pad_mask]).sum().item()
+                total += pad_mask.sum().item()              # scalar: count of real tokens
 
     model.train()
-    return {'acc': 100 * correct / total, 'loss': avg_loss / (len(dataloader) * args.grad_acc)}
-
+    avg_loss = loss_sum / max(n_batches, 1)
+    return {
+        'acc': 100 * correct / max(total, 1),
+        'loss': avg_loss,
+    }
 
 def regroup_texts(args, max_seq_len):
     cur_max_seq_len = args.cur_max_seq_len
@@ -184,30 +201,12 @@ def calculate_total_steps(args):
         total_steps = total_steps + batches_per_epoch * (args.epochs - cur_epoch)
         return total_steps
 
-def is_step(step_type: str, global_step: int, args):
-    step_arg = getattr(args, f'{step_type}_steps')
-
-    if args.all_checkpoints:
-        if global_step in args.checkpoints:
-            return True
-    else:
-        if global_step % step_arg == 0 and global_step != 0:
-            return True
-
-    return False
-
-
 
 def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.flops:
         from fvcore.nn import FlopCountAnalysis
 
-
-    if args.lamb:
-        from bitsandbytes.optim import LAMB
-        optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
     model.train()
@@ -279,11 +278,13 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # ----- LOGGING -----
-                if is_step("logging", global_step, args):
+                if global_step in args.checkpoints:
+
+                    # ----- LOGGING -----
                     epoch_float = global_step * args.epochs / args.total_steps
+                    head_similarity = head_divergence(model)
                     msg = (f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, "
-                           f"HeadSim: {head_divergence(model):.4f}, "
+                           f"HeadSim: {head_similarity:.4f}, "
                            f"LR: {scheduler.get_last_lr()[0]:.2e}")
                     if args.align_lambda > 0:
                         msg += f", AlignLoss: {align_loss_val:.4f}"
@@ -298,7 +299,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             "epoch": epoch_float,
                             "loss": loss.item(),
                             "lr": scheduler.get_last_lr()[0],
-                            "head_similarity": head_divergence(model),
+                            "head_similarity": head_similarity,
                         }
                         if args.align_lambda > 0:
                             log_dict["align_loss"] = align_loss_val
@@ -309,8 +310,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             })
                         wandb.log(log_dict)
 
-                # ----- EVALUATION -----
-                if is_step("eval", global_step, args):
+                    # ----- EVALUATION -----
                     metrics = evaluate(model, eval_dataloader, args)
                     print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}", flush=True)
 
@@ -320,14 +320,13 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             "eval_loss": metrics["loss"],
                         })
 
-                # ----- SAVING -----
-                if is_step("save", global_step, args):
+                    # ----- SAVING -----
                     save_path = os.path.join(args.output_path, f"checkpoint-{global_step}")
                     model.save_pretrained(save_path)
                     tokenizer.save_pretrained(save_path)
                     print(f"----- Saved checkpoint to: {save_path} -----", flush=True)
 
-                    # Keep only the latest 4 checkpoints
+                    # Keep only the latest 4 checkpoints (temporarely because of storage constraints)
                     ckpt_dirs = sorted(
                         [d for d in os.listdir(args.output_path)
                          if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_path, d))],

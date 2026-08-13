@@ -30,11 +30,6 @@ parser.add_argument("--grad_acc", type=int, default=1, help="Split the batch siz
 parser.add_argument("--lr", type=float, default=0.007)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--cpus", type=int, default=10)
-parser.add_argument("--logging_steps", type=int, default=100)
-parser.add_argument("--eval_steps", type=int, default=1000)
-parser.add_argument("--save_steps", type=int, default=1000)
-parser.add_argument("--all_checkpoints", action="store_true", help="Save and evaluate model every 1/10/100M tokens, \
-                    per challenge stipulations. Overrides eval_steps and save_steps.")
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
@@ -44,7 +39,6 @@ parser.add_argument("--pretrained", action="store_true", help="Load pretrained m
 parser.add_argument("--eval_only", action="store_true", help="Evaluate only")
 parser.add_argument("--debug", action="store_true", help="Activates debug mode")
 parser.add_argument("--wandb", action="store_true", help="Report to wandb")
-parser.add_argument("--lamb", action="store_true", help="LAMB optimization")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
@@ -171,31 +165,11 @@ def calculate_total_steps(args):
         total_steps = total_steps + batches_per_epoch * (args.epochs - cur_epoch)
         return total_steps
 
-def is_step(step_type: str, global_step: int, args):
-    # step_arg = args.logging_steps, args.save_steps, or args.eval_steps
-    step_arg = getattr(args, f'{step_type}_steps')
-
-    if args.all_checkpoints:
-        if global_step in args.checkpoints:
-            return True
-    else:
-        if global_step % step_arg == 0 and global_step != 0:
-            return True
-        
-    return False
-
-
-
 def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.flops:
         from fvcore.nn import FlopCountAnalysis
 
-
-    if args.lamb:
-        from bitsandbytes.optim import LAMB  # imported lazily so the script runs without bitsandbytes unless --lamb
-        optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
     model.train()
@@ -266,15 +240,15 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # ----- LOGGING -----
-                if is_step("logging", global_step, args):
+                if global_step in args.checkpoints:
+                    # ----- LOGGING -----
                     epoch_float = global_step * args.epochs / args.total_steps
                     print(f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
-                    
+                
                     if args.log_gpu_mem:
                         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
                         print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-                    
+                
                     if args.wandb:
                         log_dict = {
                             "epoch": epoch_float,
@@ -288,8 +262,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             })
                         wandb.log(log_dict)
 
-                # ----- EVALUATION -----
-                if is_step("eval", global_step, args):
+                    # ----- EVALUATION -----
                     metrics = evaluate(model, eval_dataloader, args)
                     print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}", flush=True)
 
@@ -299,12 +272,12 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             "eval_loss": metrics["loss"],
                         })
 
-                # ----- SAVING -----
-                if is_step("save", global_step, args):
+                    # ----- SAVING -----
                     save_path = os.path.join(args.output_path, f"checkpoint-{global_step}")
                     model.save_pretrained(save_path)
                     tokenizer.save_pretrained(save_path)
                     print(f"----- Saved checkpoint to: {save_path} -----", flush=True)
+
 
                 pbar.update(1)
                 global_step += 1

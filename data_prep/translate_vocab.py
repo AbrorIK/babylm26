@@ -23,6 +23,10 @@ OUTPUT = "data/prealign_triplets.tsv"
 
 PROMPT = (
     "Translate the English word into Dutch and Simplified Chinese.\n"
+    "The input word is ENGLISH. Some English words are spelled the same as an\n"
+    "unrelated Dutch word (want, kind, lot, meet) — ignore the Dutch meaning\n"
+    "and translate what the word means in ENGLISH.\n"
+    "Give the Dutch translation, not the English word repeated back.\n"
     "Answer with exactly: dutch | chinese\n"
     "No explanation, no pinyin, no extra words.\n\n"
     "Word: {word}"
@@ -114,7 +118,7 @@ def main():
         args.model, torch_dtype="auto", device_map="cuda")
     model.eval()
 
-    kept = failed = 0
+    kept = failed = echoed = 0
     with open(args.output, "a", encoding="utf-8") as out:
         for i in range(0, len(words), args.batch_size):
             batch = words[i:i + args.batch_size]
@@ -126,14 +130,20 @@ def main():
                     failed += 1
                     continue
                 dutch, chinese = parsed
+                if dutch.lower() == word.lower():
+                    echoed += 1
                 out.write(f"{word}\t{dutch}\t{chinese}\n")
                 kept += 1
             out.flush()
 
-            print(f"{i + len(batch):>6,}/{len(words):,}  kept {kept:,}  failed {failed:,}",
-                  flush=True)
+            print(f"{i + len(batch):>6,}/{len(words):,}  kept {kept:,}  "
+                  f"failed {failed:,}  dutch==english {echoed:,}", flush=True)
 
     print(f"\nwrote {kept:,} triplets to {args.output} ({failed:,} rejected)")
+    if kept:
+        print(f"dutch identical to english: {echoed:,} ({100*echoed/kept:.1f}%) "
+              f"— some are real cognates, but a high rate means the prompt is "
+              f"not landing")
 
 
 if __name__ == "__main__":

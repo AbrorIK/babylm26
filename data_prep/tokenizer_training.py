@@ -16,18 +16,18 @@ def train_tokenizer():
 
     Path("tokenizer").mkdir(exist_ok=True)
     spm.SentencePieceTrainer.train(
-        input='data/bb26_train.txt',
+        input='data/bb26_train.tsv',
         model_prefix='tokenizers/bb26-50k',
-        vocab_size=50000,                       # bumped up to leave room for forced words
+        vocab_size=50000,
         model_type='bpe',
         byte_fallback=True,
         character_coverage=0.9995,
-        user_defined_symbols=forced,   # these stay whole
+        user_defined_symbols=forced + ['[MASK]'],
         normalization_rule_name="identity",
-        unk_id=0,
-        bos_id=1,
-        eos_id=2,
-        pad_id=3
+        unk_id=0, unk_piece='[UNK]',
+        bos_id=1, bos_piece='[CLS]',
+        eos_id=2, eos_piece='[SEP]',
+        pad_id=3, pad_piece='[PAD]'
     )
     print("Tokenizer training complete!")
 

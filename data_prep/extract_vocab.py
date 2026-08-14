@@ -1,26 +1,3 @@
-"""Pick the English words worth aligning: frequent content words.
-
-Words are POS-tagged in sentence context with NLTK, and only content words are
-kept: nouns, verbs, adjectives, adverbs, pronouns, numerals. That drops
-articles, prepositions and conjunctions (no clean cross-lingual counterpart —
-"the" maps to de/het by Dutch gender, and Chinese has no articles), and drops
-proper nouns (NNP), which only transliterate.
-
-Tagging must happen in context: an isolated word list gives the tagger nothing
-to work with, and capitalisation — its main cue for proper nouns — is lost.
-
-The Penn tagset has no AUX category, so "is"/"have"/"do" carry the same VB*
-tags as "run"/"eat". No tagger can separate them, hence the small AUXILIARIES
-list below.
-
-Size matters more than the frequency threshold: PreAlign samples
-steps x groups_per_step word groups in total, so a list much larger than that
-contains words the training loop never draws.
-
-    python data_prep/extract_vocab.py                  # top 12000
-    python data_prep/extract_vocab.py --top_n 20000
-"""
-
 import argparse
 import collections
 
@@ -79,6 +56,45 @@ def is_content_word(word, tag):
     return tag.startswith(CONTENT_TAGS)
 
 
+# Penn Treebank tag -> WordNet part of speech, for the lemmatizer.
+_WORDNET_POS = {"NN": "n", "VB": "v", "JJ": "a", "RB": "r"}
+
+
+def lemmatize_counts(counts, majority):
+    """Collapse inflected forms onto their dictionary form, summing frequencies.
+
+    "takes"/"taking"/"took" all become "take". This matters because the words
+    are translated one at a time with no context: an inflected form has no clean
+    single-word translation (Dutch inflects differently), and the translator
+    tends to copy the English through unchanged rather than guess. Feeding
+    dictionary forms removes that failure at the source.
+
+    The POS tag decides how to lemmatize — "looking" is only reduced to "look"
+    when tagged as a verb, and "better" only becomes "good" as an adjective.
+    """
+    import nltk
+    nltk.data.path.insert(0, "data/nltk_data")
+    from nltk.stem import WordNetLemmatizer
+
+    lemmatizer = WordNetLemmatizer()
+    lemma_counts = collections.Counter()
+    lemma_tag = {}
+
+    for word, n in counts.items():
+        tag = majority.get(word)
+        if not is_content_word(word, tag):
+            continue
+        lemma = lemmatizer.lemmatize(word, _WORDNET_POS.get(tag[:2], "n"))
+        # Lemmatising can land on a word we exclude ("was" -> "be"), and can
+        # shorten below the minimum length.
+        if lemma in AUXILIARIES or len(lemma) < MIN_LEN:
+            continue
+        lemma_counts[lemma] += n
+        lemma_tag.setdefault(lemma, tag)
+
+    return lemma_counts, lemma_tag
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", default=CORPUS)
@@ -91,14 +107,17 @@ def main():
     print(f"{sum(counts.values()):,} tokens, {len(counts):,} types, "
           f"{len(majority):,} tagged")
 
-    kept = [w for w, _ in counts.most_common()
-            if is_content_word(w, majority.get(w))][:args.top_n]
+    lemma_counts, _ = lemmatize_counts(counts, majority)
+    print(f"{len(lemma_counts):,} content lemmas after merging inflected forms")
+
+    kept = [w for w, _ in lemma_counts.most_common()][:args.top_n]
 
     with open(args.output, "w", encoding="utf-8") as f:
         for word in kept:
             f.write(f"{word}\n")
 
-    print(f"kept {len(kept):,} words (freq {counts[kept[-1]]:,}..{counts[kept[0]]:,})")
+    print(f"kept {len(kept):,} lemmas "
+          f"(freq {lemma_counts[kept[-1]]:,}..{lemma_counts[kept[0]]:,})")
     print(f"wrote {args.output}")
     print("sample:", ", ".join(kept[:20]))
 

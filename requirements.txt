@@ -1,11 +1,18 @@
 # Core runtime
 torch>=2.1.0
-transformers>=4.40.0
+# Qwen3 architecture support (used only by data_prep/translate_vocab.py) needs >=4.51
+transformers>=4.51.0
 datasets>=2.18.0
 sentencepiece>=0.1.99
 numpy>=1.23
 tqdm>=4.66
 nltk>=3.8
+
+# Translation of the PreAlign word list with Qwen3-8B
+# (huggingface_hub[cli] provides the `huggingface-cli download` command;
+#  accelerate is required by device_map= in translate_vocab.py)
+huggingface_hub[cli]>=0.23.0
+accelerate>=0.30.0
 
 # Optional: experiment tracking (only if using --wandb)
 wandb>=0.16.0

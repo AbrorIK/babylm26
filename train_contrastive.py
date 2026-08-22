@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import math
 import torch
 import numpy as np
@@ -9,8 +10,9 @@ from transformers import AutoConfig, AutoModelForCausalLM, DebertaV2Tokenizer
 from transformers.optimization import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 
-from preprocessing import tokenize, padding_collate_fn, group_texts
-from soft_labels import build_soft_map, compile_tables, soft_label_loss
+from preprocessing import tokenize_tagged, padding_collate_fn, group_texts
+
+from prealign import load_word_groups, prealign, sample_alignment_loss
 
 try:
     import wandb
@@ -19,9 +21,9 @@ except ImportError:
     wandb_available = False
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--train_data", type=str, default="")
-parser.add_argument("--valid_data", type=str, default="data/even.dev")
-parser.add_argument("--max_seq_len", type=str, default="0:64,5:256", help="Either num or e.g. 0:32,5:64")  
+parser.add_argument("--train_data", type=str, default="data/bb26_tagged_train.tsv")
+parser.add_argument("--valid_data", type=str, default="data/bb26_tagged_validation.tsv")
+parser.add_argument("--max_seq_len", type=str, default="0:64,5:256", help="Either num or e.g. 0:32,5:64")
 parser.add_argument("--model_path", type=str, default="gpt2")
 parser.add_argument("--output_path", type=str, default="")
 parser.add_argument("--tokenizer", type=str, default=None)
@@ -35,49 +37,85 @@ parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--weight_decay", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--pretrained", action="store_true", help="Load pretrained model")
-parser.add_argument("--eval_only", action="store_true", help="Evaluate only")
 parser.add_argument("--debug", action="store_true", help="Activates debug mode")
 parser.add_argument("--wandb", action="store_true", help="Report to wandb")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
 
-# ---- soft-label cross-lingual alignment ----
-parser.add_argument("--soft_eps", type=float, default=0.20, help="Probability mass moved to translations")
-parser.add_argument("--soft_max_trans", type=int, default=4, help="Max translations per source token (K)")
-parser.add_argument("--soft_dict_en_nl", type=str, default="data/dictionaries/en-nl.txt")
-parser.add_argument("--soft_dict_en_zh", type=str, default="data/dictionaries/en-zh.txt")
+# ---- PreAlign: cross-lingual word alignment before pretraining ----
+parser.add_argument("--prealign_steps", type=int, default=0, help="0 disables PreAlign")
+parser.add_argument("--prealign_triplets", type=str, default="data/prealign_triplets.tsv")
+parser.add_argument("--prealign_alpha", type=float, default=0.1, help="Alignment loss weight")
+parser.add_argument("--prealign_lr", type=float, default=3e-4)
+parser.add_argument("--prealign_groups", type=int, default=64, help="Word groups per step")
+parser.add_argument("--prealign_tau", type=float, default=0.1, help="Contrastive temperature")
+parser.add_argument("--prealign_max_len", type=int, default=8, help="Max subwords per word")
+parser.add_argument("--prealign_only", action="store_true",
+                    help="Run PreAlign then exit — for sweeping alpha cheaply")
+
+# ---- keep aligning during main training ----
+parser.add_argument("--align_lambda", type=float, default=0.0,
+                    help="Alignment loss weight during main training (0 = off)")
+parser.add_argument("--align_every", type=int, default=1,
+                    help="Add the alignment loss every N optimizer steps")
+
 
 def evaluate(model, dataloader, args):
     model.eval()
     correct = 0
     total = 0
-    avg_loss = 0
+    loss_sum = 0.0
+    n_batches = 0
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
-            if len(batch["input_ids"]) == 0:
-                continue # NOTE: not sure why this happens in 100M case...
+            # batch["input_ids"]:      [B, T]
+            # batch["attention_mask"]: [B, T]
+            # batch["labels"]:         [B, T]
+            # batch["lang_ids"]:       [B, T]
 
+            if len(batch["input_ids"]) == 0:
+                continue
+
+            # split_batch divides B into smaller chunks of size B' = B // grad_acc
             batches = split_batch(batch, args)
             for minibatch in batches:
+                # minibatch["input_ids"]:      [B', T]
+                # minibatch["attention_mask"]: [B', T]
+                # minibatch["labels"]:         [B', T]
+
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                    outputs = model(**move_dict_to_cuda(minibatch))
+                    outputs = model(**move_dict_to_cuda(minibatch), use_cache=False)
+                    # outputs.loss:   scalar
+                    # outputs.logits: [B', T, V]
 
-                avg_loss += outputs.loss.item()
-                logits = outputs.logits
+                loss_sum += outputs.loss.item()
+                n_batches += 1
 
-                # shift by one: position t predicts token t+1
-                preds = logits[:, :-1, :].argmax(dim=-1)
-                labels = minibatch["labels"][:, 1:].to(device=logits.device)
+                logits = outputs.logits                    # [B', T, V]
+                labels = minibatch["labels"].to(device=logits.device)  # [B', T]
 
-                label_mask = labels != -100
-                correct += (preds[label_mask] == labels[label_mask]).sum().item()
-                total += preds[label_mask].numel()
+                shift_logits = logits[:, :-1, :]           # [B', T-1, V]  drop last position
+                shift_labels = labels[:, 1:]               # [B', T-1]     drop first position
+                # Now shift_logits[b, t, :] is the prediction for shift_labels[b, t]
+
+                preds = shift_logits.argmax(dim=-1)        # [B', T-1]  index of highest-scoring token
+
+                pad_mask = shift_labels != -100            # [B', T-1]  bool: True = real, False = padding
+
+                # preds[pad_mask]:        [num_real_tokens]  (1D, only real positions)
+                # shift_labels[pad_mask]: [num_real_tokens]  (1D, same positions)
+                # == comparison:          [num_real_tokens]  bool
+                # .sum():                 scalar             count of correct predictions
+                correct += (preds[pad_mask] == shift_labels[pad_mask]).sum().item()
+                total += pad_mask.sum().item()              # scalar: count of real tokens
 
     model.train()
-    return {'acc': 100 * correct / total, 'loss': avg_loss / (len(dataloader) * args.grad_acc)}
-
+    avg_loss = loss_sum / max(n_batches, 1)
+    return {
+        'acc': 100 * correct / max(total, 1),
+        'loss': avg_loss,
+    }
 
 def regroup_texts(args, max_seq_len):
     cur_max_seq_len = args.cur_max_seq_len
@@ -86,27 +124,25 @@ def regroup_texts(args, max_seq_len):
     grouped_dataset = args.dataset.map(group_texts,
         batched = True,
         fn_kwargs = {'max_len': max_seq_len},
-        # remove_columns = dataset["train"].column_names,
         num_proc=args.cpus,
         desc = "Grouping",
-        # load_from_cache_file=False,
         )
     change_ratio = max_seq_len / cur_max_seq_len
     args.batch_size = max(1, int(args.batch_size / change_ratio))
-    
+
     train_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['train'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['train'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=True, 
+        shuffle=True,
         collate_fn=padding_collate_fn
         )
-    
+
     eval_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['validation'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['validation'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=False, 
+        shuffle=False,
         collate_fn=padding_collate_fn
         )
 
@@ -130,9 +166,6 @@ def split_batch(batch, args):
 def move_dict_to_cuda(d):
     return {key: value.to(device="cuda:0") for key, value in d.items()}
 
-def calculate_num_words(examples):
-    return {'num_words': [sum(len(examples["text"][i]) for i in range(len(examples["text"])))]}
-
 def calculate_num_tokens(examples):
     return {'num_tokens': [sum(len(examples["input_ids"][i]) for i in range(len(examples["input_ids"])))]}
 
@@ -140,7 +173,7 @@ def calculate_total_steps(args):
     def calc_exs_per_epoch(tokens_per_1000, max_seq_len):
         return sum([t // max_seq_len for t in tokens_per_1000])
 
-    
+
     exs_per_epoch = calc_exs_per_epoch(args.tokens_per_1000, args.init_max_seq_len)
     batches_per_epoch = math.ceil(exs_per_epoch / args.batch_size)
     cur_epoch = 0
@@ -160,9 +193,10 @@ def calculate_total_steps(args):
             batches_per_epoch = math.ceil(exs_per_epoch / batch_size)
             cur_epoch = epoch_num
             prev_seq_len = seq_len
-    
+
         total_steps = total_steps + batches_per_epoch * (args.epochs - cur_epoch)
         return total_steps
+
 
 def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.flops:
@@ -175,11 +209,11 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     model = model.to(dtype=torch.bfloat16, device="cuda:0")
 
     if args.log_gpu_mem:
-        # Print memory usage
         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     global_step = 0
+    align_loss_val = 0.0
     print(f"Total steps: {args.total_steps}")
     print(f"Max seq len: {args.init_max_seq_len}")
     print(f"Next seq len: {args.max_seq_len}")
@@ -206,29 +240,32 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             print(f"Estimated Total FLOPs: {total*3*args.total_steps}")
                             exit()
 
+                        cuda_batch = move_dict_to_cuda(minibatch)
+                        outputs = model(**cuda_batch)
+                        loss = outputs.loss
 
-                        outputs = model(**move_dict_to_cuda(minibatch))
-
-                        # ----- main loss: soft-label alignment or standard CLM -----
-                        logits = outputs.logits  # [B,T,V]
-                        labels = minibatch["labels"].to(device=logits.device)
-                        loss = soft_label_loss(
-                            logits, labels,
-                            args.soft_true_weight,
-                            args.soft_trans_ids,
-                            args.soft_trans_wts,
-                        )
-                        # Add z-loss
+                        # z-loss on routed logits
+                        logits = outputs.logits
+                        labels = cuda_batch["labels"]
                         valid = labels.ne(-100)
-                        z = torch.logsumexp(logits, dim=-1)  # [B,T]
+                        z = torch.logsumexp(logits, dim=-1)
                         z = z.masked_select(valid)
                         z_loss = (z**2).mean() if z.numel() else torch.tensor(0., device=logits.device)
-                        lam = 0.0001  # z-loss coefficient
-                        loss = loss + lam * z_loss
+                        loss = loss + 0.0001 * z_loss
 
-                    loss = loss / args.grad_acc # To ensure consistent gradient magnitude
+                    loss = loss / args.grad_acc
                     loss.backward()
-                    
+
+                # ---- continued alignment (paper keeps this on during pretraining) ----
+                if args.align_lambda > 0 and global_step % args.align_every == 0:
+                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
+                        a_loss = sample_alignment_loss(
+                            model, tokenizer, args.align_groups,
+                            args.prealign_groups, args.prealign_max_len,
+                            args.prealign_tau, "cuda:0")
+                    align_loss_val = a_loss.item()
+                    (args.align_lambda * a_loss).backward()
+
                 # Gradient clipping and optimizer step
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -236,20 +273,27 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 optimizer.zero_grad()
 
                 if global_step in args.checkpoints:
+
                     # ----- LOGGING -----
                     epoch_float = global_step * args.epochs / args.total_steps
-                    print(f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
-                
+                    msg = (f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, "
+                           f"LR: {scheduler.get_last_lr()[0]:.2e}")
+                    if args.align_lambda > 0:
+                        msg += f", AlignLoss: {align_loss_val:.4f}"
+                    print(msg, flush=True)
+
                     if args.log_gpu_mem:
                         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
                         print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-                
+
                     if args.wandb:
                         log_dict = {
                             "epoch": epoch_float,
                             "loss": loss.item(),
-                            "lr": scheduler.get_last_lr()[0]
+                            "lr": scheduler.get_last_lr()[0],
                         }
+                        if args.align_lambda > 0:
+                            log_dict["align_loss"] = align_loss_val
                         if args.log_gpu_mem:
                             log_dict.update({
                                 "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,
@@ -273,6 +317,16 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     tokenizer.save_pretrained(save_path)
                     print(f"----- Saved checkpoint to: {save_path} -----", flush=True)
 
+                    # Keep only the latest 4 checkpoints (temporarely because of storage constraints)
+                    ckpt_dirs = sorted(
+                        [d for d in os.listdir(args.output_path)
+                         if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.output_path, d))],
+                        key=lambda x: int(x.split("-")[-1])
+                    )
+                    for old_ckpt in ckpt_dirs[:-4]:
+                        old_path = os.path.join(args.output_path, old_ckpt)
+                        shutil.rmtree(old_path)
+                        print(f"----- Removed old checkpoint: {old_path} -----", flush=True)
 
                 pbar.update(1)
                 global_step += 1
@@ -307,7 +361,7 @@ def main():
         wandb.init(
             project='babylm26',
             name=output_dir,
-            config=vars(args),   
+            config=vars(args),
         )
 
     tokenizer = DebertaV2Tokenizer.from_pretrained(args.tokenizer, do_lower_case=args.lower)
@@ -331,36 +385,29 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of model parameters: {num_params}")
 
-    print("Building soft-label alignment tables...")
-    soft_map = build_soft_map(tokenizer, args.soft_dict_en_nl, args.soft_dict_en_zh)
-    args.soft_true_weight, args.soft_trans_ids, args.soft_trans_wts = compile_tables(
-        soft_map, len(tokenizer), eps=args.soft_eps, K=args.soft_max_trans, device="cuda:0"
-    )
-    print(f"Soft-label map: {len(soft_map)} source tokens, eps={args.soft_eps}, K={args.soft_max_trans}")
-
     dataset = load_dataset('text', data_files={'train': args.train_data, 'validation': args.valid_data})
 
     if args.debug:
         dataset['train'] = dataset['train'].select(range(100))
         dataset['validation'] = dataset['validation'].select(range(100))
 
-    dataset = dataset.map(tokenize, 
-        batched = True, 
-        fn_kwargs = {'tokenizer': tokenizer, 'input_field': 'text'}, 
-        remove_columns = dataset["train"].column_names, 
+    dataset = dataset.map(tokenize_tagged,
+        batched = True,
+        fn_kwargs = {'tokenizer': tokenizer, 'input_field': 'text'},
+        remove_columns = dataset["train"].column_names,
         num_proc=args.cpus,
         desc = "Tokenizing",
     )
-        
+
     args.dataset = dataset
 
     max_seq_len = args.max_seq_len.pop(0)[1]
     args.init_max_seq_len = max_seq_len
     args.cur_max_seq_len = max_seq_len
     args.dataset_len_lines = len(dataset['train'])
-    args.tokens_per_1000 = dataset['train'].map(calculate_num_tokens, 
+    args.tokens_per_1000 = dataset['train'].map(calculate_num_tokens,
                                                        batched = True,
-                                                       num_proc=args.cpus, 
+                                                       num_proc=args.cpus,
                                                        remove_columns=dataset["train"].column_names)['num_tokens']
 
     args.dataset_len_tokens = sum(args.tokens_per_1000)
@@ -385,20 +432,33 @@ def main():
     print("Dataset length after grouping:", len(grouped_dataset['train']))
 
     train_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['train'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['train'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=True, 
+        shuffle=True,
         collate_fn=padding_collate_fn,
     )
-    
+
     eval_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['validation'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['validation'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=False, 
+        shuffle=False,
         collate_fn=padding_collate_fn,
     )
+
+    args.align_groups = []
+    if args.prealign_steps > 0 or args.align_lambda > 0:
+        args.align_groups = load_word_groups(args.prealign_triplets)
+
+    if args.prealign_steps > 0:
+        model = prealign(model, tokenizer, args.align_groups, train_dataloader, args)
+
+    if args.prealign_only:
+        print("--prealign_only set: skipping language pretraining", flush=True)
+        if args.wandb:
+            wandb.finish()
+        return
 
     train(args, model, tokenizer, train_dataloader, eval_dataloader)
 

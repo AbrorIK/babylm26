@@ -21,8 +21,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
-    from multihead_model import MultiHeadGPT2LMHeadModel
+    from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 try:
     import wandb
@@ -113,21 +112,22 @@ def encode_words(
 
 
 def word_reps(
-    model: MultiHeadGPT2LMHeadModel,
+    model: PreTrainedModel,
     input_ids: Tensor,        # [N, L]
     attention_mask: Tensor,   # [N, L]
 ) -> list[Tensor]:
     """Run words through the transformer trunk and get one vector per word per layer.
 
     Words that span multiple subwords are mean-pooled into a single vector.
-    Skips the language heads entirely — only uses the shared trunk.
+    Uses model.base_model — the shared trunk — so the output head(s) are
+    skipped entirely and no architecture-specific attributes are needed.
 
     Returns a list of (num_layers + 1) tensors, each of shape [N, D].
         Index 0 = embedding layer output
         Index 1..12 = transformer layer outputs
         D = hidden dimension (e.g. 768)
     """
-    outputs = model.transformer(
+    outputs = model.base_model(
         input_ids=input_ids,              # [N, L]
         attention_mask=attention_mask,     # [N, L]
         output_hidden_states=True,
@@ -154,7 +154,7 @@ def word_reps(
     return reps  # list of (num_layers+1) tensors, each [N, D]
 
 
-def supcon_loss(reps: Tensor, group_ids: Tensor, temperature: float = 0.1) -> Tensor:
+def contrastive_loss(reps: Tensor, group_ids: Tensor, temperature: float = 0.1) -> Tensor:
     """Contrastive loss: push translations together, push unrelated words apart.
 
     For each word (the "anchor"), its translations are "positives" and everything
@@ -212,7 +212,7 @@ def supcon_loss(reps: Tensor, group_ids: Tensor, temperature: float = 0.1) -> Te
 
 
 def alignment_loss(
-    model: MultiHeadGPT2LMHeadModel,
+    model: PreTrainedModel,
     input_ids: Tensor,        # [N, L]
     attention_mask: Tensor,   # [N, L]
     group_ids: Tensor,        # [N]
@@ -226,7 +226,7 @@ def alignment_loss(
     Returns a scalar loss tensor.
     """
     reps = word_reps(model, input_ids, attention_mask)  # list of (L+1) × [N, D]
-    losses = [supcon_loss(r, group_ids, temperature) for r in reps]  # list of (L+1) scalars
+    losses = [contrastive_loss(r, group_ids, temperature) for r in reps]  # list of (L+1) scalars
     return torch.stack(losses).mean()                   # scalar: average across layers
 
 
@@ -252,7 +252,7 @@ def negative_similarity(reps: Tensor, group_ids: Tensor) -> float:
 
 
 def sample_alignment_loss(
-    model: MultiHeadGPT2LMHeadModel,
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     groups: list[WordGroup],
     n_groups: int,
@@ -278,12 +278,12 @@ def sample_alignment_loss(
 
 
 def prealign(
-    model: MultiHeadGPT2LMHeadModel,
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     groups: list[WordGroup],
     dataloader: DataLoader[LMBatch],
     args: argparse.Namespace,
-) -> MultiHeadGPT2LMHeadModel:
+) -> PreTrainedModel:
     """Run 500 steps of alignment + language modeling, then return the model.
 
     Each step:
@@ -298,10 +298,13 @@ def prealign(
     """
     device: str = DEVICE
     model.train()
+    # The ignores are a stub artefact: transformers decorates
+    # PreTrainedModel.to(), and mypy reads the wrapper as an unbound method
+    # wanting an explicit `self`. The call is ordinary nn.Module.to().
     if device.startswith("cuda"):
-        model = model.to(dtype=torch.bfloat16, device=device)
+        model = model.to(dtype=torch.bfloat16, device=device)  # type: ignore[call-arg]
     else:
-        model = model.to(device=device)
+        model = model.to(device=device)  # type: ignore[call-arg]
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.prealign_lr)
     n_groups: int = min(args.prealign_groups, len(groups))
@@ -362,7 +365,7 @@ def prealign(
             #   reps[12] = transformer layer 12 output
 
             align = torch.stack(
-                [supcon_loss(r, group_ids, args.prealign_tau) for r in reps]
+                [contrastive_loss(r, group_ids, args.prealign_tau) for r in reps]
             ).mean()
             # supcon_loss returns a scalar for each of the 13 layers
             # torch.stack makes them into a [13] tensor
@@ -394,18 +397,16 @@ def prealign(
                     "prealign/neg_similarity": neg_sim,
                     "prealign/step": step,
                 })
-
-    # ==== REFRESH LANGUAGE HEADS ====
-    # The 3 language heads started as copies of the embedding table (wte).
-    # PreAlign has changed wte. Copy the updated wte into all heads so
-    # main training starts from the aligned embeddings.
+    embeddings = model.get_input_embeddings().weight
+    
     with torch.no_grad():
-        for head in model.heads:
-            # head.weight: [vocab_size, D]
-            # model.transformer.wte.weight: [vocab_size, D]
-            head.weight.copy_(model.transformer.wte.weight)
-
-    print("PreAlign done; heads refreshed from aligned embeddings", flush=True)
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None:
+            print("no output layer found, nothing to refresh", flush=True)
+        if lm_head.weight is embeddings:            # tied: literally the same tensor
+            print("tied to embeddings, already aligned", flush=True)
+        lm_head.weight.copy_(embeddings)
+        print("refreshed untied lm_head from embeddings", flush=True)
 
     print(f"PREALIGN SUMMARY  "
           f"alpha={args.prealign_alpha}  "

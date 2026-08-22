@@ -1,16 +1,3 @@
-"""Translate the English word list into Dutch and Chinese with Qwen3-8B.
-
-Produces [eng, nld, zho] triplets for PreAlign. One prompt asks for both
-languages at once, and prompts are generated in batches — one word at a time
-would take most of a day for 12k words.
-
-Output: data/prealign_triplets.tsv   ``eng \t nld \t zho``
-Progress is flushed after every batch, and an existing output file is resumed
-rather than restarted.
-
-    python data_prep/translate_vocab.py --model ./Qwen3-8B
-"""
-
 import argparse
 import os
 import re

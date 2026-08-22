@@ -14,9 +14,8 @@ from preprocessing import tokenize_tagged, padding_collate_fn, group_texts
 from multihead_model import (
     MultiHeadGPT2Config,
     MultiHeadGPT2LMHeadModel,
-    head_divergence,
+    head_similarity,
 )
-from prealign import load_word_groups, prealign, sample_alignment_loss
 
 try:
     import wandb
@@ -46,23 +45,6 @@ parser.add_argument("--wandb", action="store_true", help="Report to wandb")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
-
-# ---- PreAlign: cross-lingual word alignment before pretraining ----
-parser.add_argument("--prealign_steps", type=int, default=0, help="0 disables PreAlign")
-parser.add_argument("--prealign_triplets", type=str, default="data/prealign_triplets.tsv")
-parser.add_argument("--prealign_alpha", type=float, default=0.1, help="Alignment loss weight")
-parser.add_argument("--prealign_lr", type=float, default=3e-4)
-parser.add_argument("--prealign_groups", type=int, default=64, help="Word groups per step")
-parser.add_argument("--prealign_tau", type=float, default=0.1, help="Contrastive temperature")
-parser.add_argument("--prealign_max_len", type=int, default=8, help="Max subwords per word")
-parser.add_argument("--prealign_only", action="store_true",
-                    help="Run PreAlign then exit — for sweeping alpha cheaply")
-
-# ---- keep aligning during main training ----
-parser.add_argument("--align_lambda", type=float, default=0.0,
-                    help="Alignment loss weight during main training (0 = off)")
-parser.add_argument("--align_every", type=int, default=1,
-                    help="Add the alignment loss every N optimizer steps")
 
 
 def evaluate(model, dataloader, args):
@@ -217,7 +199,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
         print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     global_step = 0
-    align_loss_val = 0.0
     print(f"Total steps: {args.total_steps}")
     print(f"Max seq len: {args.init_max_seq_len}")
     print(f"Next seq len: {args.max_seq_len}")
@@ -262,16 +243,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     loss = loss / args.grad_acc
                     loss.backward()
 
-                # ---- continued alignment (paper keeps this on during pretraining) ----
-                if args.align_lambda > 0 and global_step % args.align_every == 0:
-                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                        a_loss = sample_alignment_loss(
-                            model, tokenizer, args.align_groups,
-                            args.prealign_groups, args.prealign_max_len,
-                            args.prealign_tau, "cuda:0")
-                    align_loss_val = a_loss.item()
-                    (args.align_lambda * a_loss).backward()
-
                 # Gradient clipping and optimizer step
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -282,13 +253,10 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
                     # ----- LOGGING -----
                     epoch_float = global_step * args.epochs / args.total_steps
-                    head_similarity = head_divergence(model)
-                    msg = (f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, "
-                           f"HeadSim: {head_similarity:.4f}, "
-                           f"LR: {scheduler.get_last_lr()[0]:.2e}")
-                    if args.align_lambda > 0:
-                        msg += f", AlignLoss: {align_loss_val:.4f}"
-                    print(msg, flush=True)
+                    head_sim = head_similarity(model)
+                    print(f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, "
+                          f"HeadSim: {head_sim:.4f}, "
+                          f"LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
 
                     if args.log_gpu_mem:
                         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
@@ -299,10 +267,8 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             "epoch": epoch_float,
                             "loss": loss.item(),
                             "lr": scheduler.get_last_lr()[0],
-                            "head_similarity": head_similarity,
+                            "head_sim": head_sim,
                         }
-                        if args.align_lambda > 0:
-                            log_dict["align_loss"] = align_loss_val
                         if args.log_gpu_mem:
                             log_dict.update({
                                 "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,
@@ -458,19 +424,6 @@ def main():
         shuffle=False,
         collate_fn=padding_collate_fn,
     )
-
-    args.align_groups = []
-    if args.prealign_steps > 0 or args.align_lambda > 0:
-        args.align_groups = load_word_groups(args.prealign_triplets)
-
-    if args.prealign_steps > 0:
-        model = prealign(model, tokenizer, args.align_groups, train_dataloader, args)
-
-    if args.prealign_only:
-        print("--prealign_only set: skipping language pretraining", flush=True)
-        if args.wandb:
-            wandb.finish()
-        return
 
     train(args, model, tokenizer, train_dataloader, eval_dataloader)
 

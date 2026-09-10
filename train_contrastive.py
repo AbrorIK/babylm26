@@ -10,7 +10,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, DebertaV2Tokenizer
 from transformers.optimization import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 
-from preprocessing import tokenize_tagged, padding_collate_fn, group_texts
+from preprocessing import tokenize, padding_collate_fn, group_texts
 
 from prealign import load_word_groups, prealign, sample_alignment_loss
 
@@ -57,7 +57,7 @@ parser.add_argument("--prealign_only", action="store_true",
 # ---- keep aligning during main training ----
 parser.add_argument("--align_lambda", type=float, default=0.0,
                     help="Alignment loss weight during main training (0 = off)")
-parser.add_argument("--align_every", type=int, default=1,
+parser.add_argument("--align_every", type=int, default=10,
                     help="Add the alignment loss every N optimizer steps")
 
 
@@ -256,7 +256,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     loss = loss / args.grad_acc
                     loss.backward()
 
-                # ---- continued alignment (paper keeps this on during pretraining) ----
+                # ---- CONTRASTIVE ALIGNMENT ----
                 if args.align_lambda > 0 and global_step % args.align_every == 0:
                     with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
                         a_loss = sample_alignment_loss(
@@ -391,7 +391,7 @@ def main():
         dataset['train'] = dataset['train'].select(range(100))
         dataset['validation'] = dataset['validation'].select(range(100))
 
-    dataset = dataset.map(tokenize_tagged,
+    dataset = dataset.map(tokenize,
         batched = True,
         fn_kwargs = {'tokenizer': tokenizer, 'input_field': 'text'},
         remove_columns = dataset["train"].column_names,

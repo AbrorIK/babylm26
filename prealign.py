@@ -1,13 +1,3 @@
-"""
-PreAlign: before training the language model, briefly train the model so that
-translations of the same word (e.g. "cat", "kat", "猫") end up with similar
-internal representations. This shapes the shared trunk before the LM objective
-pushes languages apart.
-
-Only the trunk (embeddings + transformer layers) is aligned.
-The language heads are left alone.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -87,12 +77,9 @@ def encode_words(
 ) -> tuple[Tensor, Tensor]:
     """Convert words to token IDs and pad them to equal length.
 
-    A word like "unbelievable" may become multiple subword tokens [348, 12, 9921].
-    All words are padded to the length of the longest one.
-
     Returns (input_ids, attention_mask).
-        input_ids:      [N, L]  — token numbers, 0 = padding
-        attention_mask: [N, L]  — 1 = real token, 0 = padding
+        input_ids:      [N, L]  —- token numbers, 0 = padding
+        attention_mask: [N, L]  —- 1 = real token, 0 = padding
         where N = number of words, L = length of longest word in subwords
     """
     sequences: list[list[int]] = []
@@ -397,16 +384,6 @@ def prealign(
                     "prealign/neg_similarity": neg_sim,
                     "prealign/step": step,
                 })
-    embeddings = model.get_input_embeddings().weight
-    
-    with torch.no_grad():
-        lm_head = getattr(model, "lm_head", None)
-        if lm_head is None:
-            print("no output layer found, nothing to refresh", flush=True)
-        if lm_head.weight is embeddings:            # tied: literally the same tensor
-            print("tied to embeddings, already aligned", flush=True)
-        lm_head.weight.copy_(embeddings)
-        print("refreshed untied lm_head from embeddings", flush=True)
 
     print(f"PREALIGN SUMMARY  "
           f"alpha={args.prealign_alpha}  "

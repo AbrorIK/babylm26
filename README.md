@@ -31,6 +31,49 @@ equal language ratios, and language tags (`eng\t<text>`) needed by the multi-hea
 | `--out-train` | `data/bb26_train.tsv`      | Output training file                                     |
 | `--out-valid` | `data/bb26_validation.tsv` | Output validation file                                   |
 
+## Running the experiments (4 conditions x 3 seeds)
+
+Every condition is a SLURM job array of three tasks, one per seed. The seeds
+are **0, 1, 2**, fixed a priori and identical across all four conditions, so a
+difference between conditions is a difference in mechanism rather than in which
+seeds happened to be drawn. Seed 0 is the training scripts' own default, so the
+earlier single-seed results reappear as the seed-0 replicate and can be used to
+check that the retrain reproduces them.
+
+The corpus shuffle/split seed is a *different* seed and stays pinned at 42 in
+`data_prep/build_dataset.py`; every run therefore sees exactly the same training
+and validation data, and the three seeds vary only initialisation, batch order,
+and (for the contrastive condition) the word-group sampling in `prealign.py`.
+
+```bash
+mkdir -p logs                       # SLURM writes logs before the job body runs
+bash jobs/submit_all_seeds.sh       # 4 arrays x 3 seeds = 12 runs
+```
+
+Or one condition at a time:
+
+```bash
+sbatch jobs/job_train_baseline.sh
+sbatch jobs/job_train_softlabel.sh
+sbatch jobs/job_train_multihead.sh
+sbatch jobs/job_train_contrastive.sh
+```
+
+To rerun a single seed, select its array index (index i is seed i):
+
+```bash
+sbatch --array=1 jobs/job_train_contrastive.sh
+```
+
+Checkpoints land in `output/gpt2-<condition>-seed<N>/`, which is also the W&B
+run name; the three seeds of a condition share a `WANDB_RUN_GROUP` so they group
+together in the dashboard. Logs are `logs/log_<arrayjobid>_<task>.{out,err}`.
+
+Note: `jobs/job_train_contrastive.sh` was previously named
+`job_train_prealign.sh` and wrote to `output/gpt2-multihead-prealign`. That name
+was a mislabel — `train_contrastive.py` builds a plain `AutoModelForCausalLM`
+and has no multi-head component.
+
 ## Training
 
 To train our hard_decay model, for example, run:

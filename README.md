@@ -46,18 +46,22 @@ and validation data, and the three seeds vary only initialisation, batch order,
 and (for the contrastive condition) the word-group sampling in `prealign.py`.
 
 ```bash
-mkdir -p logs                       # SLURM writes logs before the job body runs
-bash jobs/submit_all_seeds.sh       # 4 arrays x 3 seeds = 12 runs
+bash jobs/submit_all_seeds.sh                               # 4 arrays x 3 seeds = 12 runs
+bash jobs/submit_all_seeds.sh baseline softlabel multihead  # or a subset
 ```
 
-Or one condition at a time:
+The submit script creates each `logs/<condition>/` directory before submitting,
+which matters because SLURM opens its log files before the job body runs and
+will not create a missing directory — the job fails instead. Submitting a job by
+hand therefore needs the directory first:
 
 ```bash
-sbatch jobs/job_train_baseline.sh
-sbatch jobs/job_train_softlabel.sh
-sbatch jobs/job_train_multihead.sh
-sbatch jobs/job_train_contrastive.sh
+mkdir -p logs/baseline && sbatch jobs/job_train_baseline.sh
 ```
+
+The same applies to the two jobs `submit_all_seeds.sh` does not cover:
+`logs/sweep/` for `job_prealign_sweep.sh`, `logs/translate/` for
+`job_translate.sh`.
 
 To rerun a single seed, select its array index (index i is seed i):
 
@@ -65,9 +69,16 @@ To rerun a single seed, select its array index (index i is seed i):
 sbatch --array=1 jobs/job_train_contrastive.sh
 ```
 
-Checkpoints land in `output/gpt2-<condition>-seed<N>/`, which is also the W&B
-run name; the three seeds of a condition share a `WANDB_RUN_GROUP` so they group
-together in the dashboard. Logs are `logs/log_<arrayjobid>_<task>.{out,err}`.
+Checkpoints land in `$WORK/output/gpt2-<condition>-seed<N>/`, whose basename is
+also the W&B run name; the three seeds of a condition share a `WANDB_RUN_GROUP`
+so they group together in the dashboard. Logs stay under the project directory
+in `$HOME`, organised per condition as
+`logs/<condition>/log_<arrayjobid>_<task>.{out,err}`.
+
+Model outputs go to `$WORK` (10 TB, shared with the group, **not backed up**)
+because `$HOME` (100 GB, backed up) is full and holds the code, data and logs.
+`$WORK` also limits the number of files, so only few-and-large things belong
+there — checkpoints qualify, the virtualenv and caches do not.
 
 Note: `jobs/job_train_contrastive.sh` was previously named
 `job_train_prealign.sh` and wrote to `output/gpt2-multihead-prealign`. That name

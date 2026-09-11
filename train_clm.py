@@ -29,6 +29,8 @@ parser.add_argument("--grad_acc", type=int, default=1, help="Split the batch siz
 parser.add_argument("--lr", type=float, default=0.007)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--cpus", type=int, default=10)
+parser.add_argument("--dl_workers", type=int, default=4,
+                    help="DataLoader worker processes per loader")
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
@@ -99,7 +101,7 @@ def regroup_texts(args, max_seq_len):
     train_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['train'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=True, 
         collate_fn=padding_collate_fn
         )
@@ -107,7 +109,7 @@ def regroup_texts(args, max_seq_len):
     eval_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['validation'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=False, 
         collate_fn=padding_collate_fn
         )
@@ -377,7 +379,7 @@ def main():
     train_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['train'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=True, 
         collate_fn=padding_collate_fn,
     )
@@ -385,7 +387,7 @@ def main():
     eval_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['validation'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=False, 
         collate_fn=padding_collate_fn,
     )

@@ -16,7 +16,7 @@ def train_tokenizer():
 
     Path("tokenizer").mkdir(exist_ok=True)
     spm.SentencePieceTrainer.train(
-        input='data/bb26_train.tsv',
+        input='data/bb26_train.txt',
         model_prefix='tokenizers/bb26-50k',
         vocab_size=50000,
         model_type='bpe',

@@ -1,7 +1,7 @@
 # Core runtime
 torch>=2.1.0
 # Qwen3 architecture support (used only by data_prep/translate_vocab.py) needs >=4.51
-transformers>=4.51.0
+transformers==4.57.6
 datasets>=2.18.0
 sentencepiece>=0.1.99
 numpy>=1.23

@@ -257,13 +257,12 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
                     # ----- EVALUATION -----
                     metrics = evaluate(model, eval_dataloader, args)
-                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}, PPL: {metrics['ppl']:.2f} -----", flush=True)
+                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f} -----", flush=True)
 
                     if args.wandb:
                         wandb.log({
                             "eval_acc": metrics["acc"],
                             "eval_loss": metrics["loss"],
-                            "eval_ppl": metrics["ppl"],
                         })
 
                     # ----- SAVING -----

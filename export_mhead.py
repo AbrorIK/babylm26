@@ -16,7 +16,7 @@ import os
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel, DebertaV2Tokenizer
 
-from multihead_model import MultiHeadGPT2LMHeadModel, LANG2ID
+from mhead_model import MultiHeadGPT2LMHeadModel, LANG2ID
 
 ID2LANG = {v: k for k, v in LANG2ID.items()}
 

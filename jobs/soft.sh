@@ -8,8 +8,9 @@
 #SBATCH -o logs/log_%A_%a.out
 #SBATCH -e logs/log_%A_%a.err
 
-# Soft labels: bilingual-dictionary mass spread over translations of the target
-# token. Submitted as a 3-task array, one task per seed. To rerun a single seed,
+# Soft labels: 80% on the true token, 10% on the first token of its Dutch
+# translation, 10% on the first token of its Chinese translation. Submitted as a
+# 3-task array, one task per seed. To rerun a single seed,
 # select its array index: sbatch --array=1 jobs/job_train_softlabel.sh
 
 # ---- Seeds ----
@@ -48,10 +49,10 @@ fi
 # ---- Configuration Variables ----
 TRAIN_DATA="data/bb26_train.txt"
 VALID_DATA="data/bb26_validation.txt"
-TOKENIZER_DIR="tokenizers/bb26-50k.model"      # forced-token tokenizer (soft-labeling needs this)
+TOKENIZER_DIR="tokenizers/bb26-40k"
 OUTPUT_DIR="$WORK/output/gpt2-softlabel-seed$SEED"
-DICT_EN_NL="data/dictionaries/en-nl.txt"
-DICT_EN_ZH="data/dictionaries/en-zh.txt"
+TRIPLETS="data/prealign_triplets.tsv"
+VOCAB="data/prealign_vocab.txt"
 
 export WANDB_RUN_GROUP="softlabel"
 
@@ -72,10 +73,10 @@ python train_soft.py \
     --seed $SEED \
     --cpus $SLURM_CPUS_PER_TASK \
     --wandb \
-    --soft_eps 0.15 \
-    --soft_max_trans 4 \
-    --soft_dict_en_nl $DICT_EN_NL \
-    --soft_dict_en_zh $DICT_EN_ZH
+    --soft_eps 0.10 \
+    --soft_max_trans 2 \
+    --triplets $TRIPLETS \
+    --vocab $VOCAB
 
 echo "=========================================="
 echo "End time: $(date)"

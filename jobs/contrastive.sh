@@ -42,7 +42,7 @@ fi
 # ---- Configuration Variables ----
 TRAIN_DATA="data/bb26_tagged_train.tsv"
 VALID_DATA="data/bb26_tagged_validation.tsv"
-TOKENIZER_DIR="tokenizers/bb26-50k.model"
+TOKENIZER_DIR="tokenizers/bb26-40k"
 OUTPUT_DIR="$WORK/output/gpt2-contrastive-seed$SEED"
 TRIPLETS="data/prealign_triplets.tsv"
 

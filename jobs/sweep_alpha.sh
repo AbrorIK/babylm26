@@ -43,7 +43,7 @@ fi
 
 TRAIN_DATA="data/bb26_tagged_train.tsv"
 VALID_DATA="data/bb26_tagged_validation.tsv"
-TOKENIZER_DIR="tokenizers/bb26-50k.model"
+TOKENIZER_DIR="tokenizers/bb26-40k"
 TRIPLETS="data/prealign_triplets.tsv"
 
 for ALPHA in 0.3 1.0 3.0 10.0; do

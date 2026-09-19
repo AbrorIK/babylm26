@@ -56,7 +56,7 @@ fi
 # ---- Configuration Variables ----
 TRAIN_DATA="data/bb26_train.txt"
 VALID_DATA="data/bb26_validation.txt"
-TOKENIZER_DIR="tokenizers/bb26-50k.model"      # same tokenizer as every other condition
+TOKENIZER_DIR="tokenizers/bb26-40k"      # same tokenizer as every other condition
 OUTPUT_DIR="$WORK/output/gpt2-baseline-seed$SEED"
 
 # wandb takes the run name from the output directory basename, so each seed is

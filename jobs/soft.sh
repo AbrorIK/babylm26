@@ -58,7 +58,7 @@ export WANDB_RUN_GROUP="softlabel"
 echo "Starting soft-label training (seed $SEED)..."
 
 # ---- Run Training ----
-python train_soft_label.py \
+python train_soft.py \
     --train_data $TRAIN_DATA \
     --valid_data $VALID_DATA \
     --tokenizer $TOKENIZER_DIR \
@@ -71,7 +71,6 @@ python train_soft_label.py \
     --lr 5e-4 \
     --seed $SEED \
     --cpus $SLURM_CPUS_PER_TASK \
-    --lower \
     --wandb \
     --soft_eps 0.15 \
     --soft_max_trans 4 \

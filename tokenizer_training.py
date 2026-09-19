@@ -1,40 +1,35 @@
-import sentencepiece as spm
-from pathlib import Path
+from tokenizers import (Tokenizer, models, normalizers, pre_tokenizers,
+                        decoders, processors, trainers, Regex)
+from transformers import PreTrainedTokenizerFast
 
+OUT_DIR = "tokenizers/bb26-40k"
 
-def load_forced_tokens(path="tokenizers/forced_tokens.txt"):
-    if not Path(path).exists():
-        return []
-    with open(path, encoding="utf-8") as f:
-        return [line.rstrip("\n") for line in f if line.strip()]
+tok = Tokenizer(models.BPE(unk_token="[UNK]"))
+tok.normalizer = normalizers.Sequence([normalizers.NFKC(), normalizers.Replace(Regex(r"\s+"), " ") , normalizers.Lowercase()])
+tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always")
+tok.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always")
 
+trainer = trainers.BpeTrainer(
+    vocab_size=40000,
+    special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"],
+    min_frequency=2,
+)
+tok.train(["data/bb26_train.txt"], trainer)
 
-def train_tokenizer():
-    print("Training tokenizer")
-    forced = load_forced_tokens()
-    print(f"Forcing {len(forced)} dictionary words to be single tokens")
+# Must come after train(): the ids only exist once the vocab is built.
+tok.post_processor = processors.TemplateProcessing(
+    single="[CLS] $A [SEP]",
+    pair="[CLS] $A [SEP] $B [SEP]",
+    special_tokens=[("[CLS]", tok.token_to_id("[CLS]")),
+                    ("[SEP]", tok.token_to_id("[SEP]"))],
+)
 
-    Path("tokenizer").mkdir(exist_ok=True)
-    spm.SentencePieceTrainer.train(
-        input='data/bb26_train.txt',
-        model_prefix='tokenizers/bb26-50k',
-        vocab_size=50000,
-        model_type='bpe',
-        byte_fallback=True,
-        character_coverage=0.9995,
-        user_defined_symbols=forced + ['[MASK]'],
-        normalization_rule_name="identity",
-        unk_id=0, unk_piece='[UNK]',
-        bos_id=1, bos_piece='[CLS]',
-        eos_id=2, eos_piece='[SEP]',
-        pad_id=3, pad_piece='[PAD]'
-    )
-    print("Tokenizer training complete!")
-
-
-def main():
-    train_tokenizer()
-
-
-if __name__ == "__main__":
-    main()
+hf = PreTrainedTokenizerFast(
+    tokenizer_object=tok,
+    unk_token="[UNK]", cls_token="[CLS]", sep_token="[SEP]",
+    pad_token="[PAD]", mask_token="[MASK]",
+    bos_token="[CLS]", eos_token="[SEP]",
+    model_max_length=1024,
+)
+hf.save_pretrained(OUT_DIR)
+print(f"saved {OUT_DIR} (vocab {len(hf)})")

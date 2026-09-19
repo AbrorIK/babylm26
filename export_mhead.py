@@ -14,7 +14,7 @@ Usage:
 import argparse
 import os
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel, DebertaV2Tokenizer
+from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
 from mhead_model import MultiHeadGPT2LMHeadModel, LANG2ID
 
@@ -31,9 +31,9 @@ def export(checkpoint_path, output_dir=None, tokenizer_path=None):
     mh_config = mh_model.config
 
     if tokenizer_path:
-        tokenizer = DebertaV2Tokenizer.from_pretrained(tokenizer_path)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
     else:
-        tokenizer = DebertaV2Tokenizer.from_pretrained(checkpoint_path)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint_path)
 
     trunk_state = mh_model.transformer.state_dict()
 

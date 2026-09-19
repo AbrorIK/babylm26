@@ -59,7 +59,6 @@ for ALPHA in 0.3 1.0 3.0 10.0; do
         --batch_size 256 \
         --grad_acc 8 \
         --cpus $SLURM_CPUS_PER_TASK \
-        --lower \
         --prealign_steps 500 \
         --prealign_triplets $TRIPLETS \
         --prealign_alpha $ALPHA \

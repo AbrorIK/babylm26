@@ -51,7 +51,7 @@ export WANDB_RUN_GROUP="multihead"
 echo "Starting multi-head training (seed $SEED)..."
 
 # ---- Run Training ----
-python train_multihead.py \
+python train_mhead.py \
     --train_data $TRAIN_DATA \
     --valid_data $VALID_DATA \
     --tokenizer $TOKENIZER_DIR \
@@ -64,7 +64,6 @@ python train_multihead.py \
     --lr 5e-4 \
     --seed $SEED \
     --cpus $SLURM_CPUS_PER_TASK \
-    --lower \
     --wandb
 
 echo "=========================================="

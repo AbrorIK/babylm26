@@ -80,7 +80,6 @@ python train_contrastive.py \
     --lr 5e-4 \
     --seed $SEED \
     --cpus $SLURM_CPUS_PER_TASK \
-    --lower \
     --wandb \
     --log_gpu_mem \
     --prealign_steps $PREALIGN_STEPS \

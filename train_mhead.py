@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from transformers import set_seed
-from transformers import AutoConfig, DebertaV2Tokenizer
+from transformers import AutoConfig, PreTrainedTokenizerFast
 from transformers.optimization import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 
@@ -341,7 +341,7 @@ def main():
             config=vars(args),
         )
 
-    tokenizer = DebertaV2Tokenizer.from_pretrained(args.tokenizer, do_lower_case=args.lower)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer)
 
     # Build config from GPT-2 base, then override
     base_config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)

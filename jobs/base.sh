@@ -66,7 +66,7 @@ export WANDB_RUN_GROUP="baseline"
 echo "Starting baseline training (seed $SEED)..."
 
 # ---- Run Training ----
-python train_clm.py \
+python train_base.py \
     --train_data $TRAIN_DATA \
     --valid_data $VALID_DATA \
     --tokenizer $TOKENIZER_DIR \
@@ -79,7 +79,6 @@ python train_clm.py \
     --lr 5e-4 \
     --seed $SEED \
     --cpus $SLURM_CPUS_PER_TASK \
-    --lower \
     --wandb
 
 echo "=========================================="

@@ -1,61 +1,69 @@
 """
-Dictionary soft-label cross-lingual alignment for causal LM training.
+Triplet soft-label cross-lingual alignment for causal LM training.
 
-Given single-token dictionary pairs, we nudge the model so that when it predicts
-a word, a little probability mass also lands on that word's translations. This
-requires the source and target words to be single tokens (guaranteed by the
-forced-token tokenizer).
+Given (english, dutch, chinese) triplets, we nudge the model so that when it
+predicts an English word, a little probability mass also lands on the FIRST
+token of each translation. Only the first token is modelled: the rest of the
+translation is ignored, which keeps the target well defined under left-to-right
+decoding.
+
+Keys are English words that are a single token, so one token id means one word.
 """
-
-from collections import defaultdict
 
 import torch
 
 
-def _read_pairs(path):
-    """Yield (source, target) word pairs from a MUSE dict (tab- or space-separated)."""
-    with open(path, encoding="utf-8") as f:
+def _readers(tokenizer):
+    """Two ways to get a word's first token id.
+
+    initial(): the word as it appears after whitespace, i.e. metaspace-prefixed.
+    Correct for English and Dutch.
+
+    mid(): the word as it appears with no preceding space. Correct for Chinese,
+    where the corpus is unsegmented and the prefixed form is a different id.
+    """
+    encode = lambda s: tokenizer.encode(s, add_special_tokens=False)
+
+    def initial(word):
+        ids = encode(word)
+        return ids[0] if ids else None
+
+    def mid(word):
+        ids = encode("x" + word)
+        return ids[1] if len(ids) > 1 else None
+
+    return encode, initial, mid
+
+
+def build_triplet_map(tokenizer, triplets_path):
+    """Build {en_id: [nl_id, zh_id]} from a tab-separated triplet file."""
+    encode, initial, mid = _readers(tokenizer)
+
+    triplet_map = {}
+    with open(triplets_path, encoding="utf-8") as f:
         for line in f:
-            line = line.rstrip("\n")
-            parts = line.split("\t") if "\t" in line else line.rsplit(" ", 1)
-            if len(parts) == 2 and parts[0] and parts[1]:
-                yield parts[0].strip().lower(), parts[1].strip().lower()
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 3:
+                continue
+            en, nl, zh = (p.strip() for p in parts)
+
+            ids = encode(en)
+            if len(ids) != 1:
+                continue
+            en_id = ids[0]
+            targets = [t for t in (initial(nl), mid(zh)) if t is not None and t != en_id]
+            if targets:
+                triplet_map[en_id] = targets
+
+    return triplet_map
 
 
-def build_soft_map(tokenizer, dict_en_nl=None, dict_en_zh=None, use_t2s=True):
-    """Build {src_id: set(tgt_ids)} for pairs that are single tokens, both directions."""
-    convert = (lambda w: w)
-    if use_t2s:
-        from opencc import OpenCC
-        convert = OpenCC("t2s").convert   # traditional -> simplified Chinese
-
-    def single_id(word):
-        ids = tokenizer.encode(word, add_special_tokens=False)
-        return ids[0] if len(ids) == 1 else None
-
-    soft_map = defaultdict(set)
-
-    def add(a, b):
-        ia, ib = single_id(a), single_id(b)
-        if ia is not None and ib is not None and ia != ib:
-            soft_map[ia].add(ib)   # a -> b
-            soft_map[ib].add(ia)   # b -> a  (reverse direction)
-
-    if dict_en_nl:
-        for en, nl in _read_pairs(dict_en_nl):
-            add(en, nl)
-    if dict_en_zh:
-        for en, zh in _read_pairs(dict_en_zh):
-            add(en, convert(zh))
-
-    return soft_map
-
-
-def compile_tables(soft_map, vocab_size, eps=0.15, K=4, device="cuda:0"):
+def compile_tables(soft_map, vocab_size, eps=0.10, K=2, device="cuda:0"):
     """Turn the map into lookup tables indexed by token id.
 
-    Defaults mean 'train normally': true_weight=1, trans_wts=0. Only mapped
-    tokens get true_weight=1-eps and eps spread over their translations.
+    eps is the mass given to EACH translation, so a token with both gets
+    80/10/10 and one with only a usable Chinese translation gets 90/10.
+    Unmapped tokens keep true_weight=1 and trans_wts=0, i.e. plain CE.
     """
     true_weight = torch.ones(vocab_size)
     trans_ids = torch.zeros(vocab_size, K, dtype=torch.long)   # pad id 0
@@ -65,10 +73,10 @@ def compile_tables(soft_map, vocab_size, eps=0.15, K=4, device="cuda:0"):
         targets = list(targets)[:K]
         if not targets:
             continue
-        true_weight[src_id] = 1.0 - eps
+        true_weight[src_id] = 1.0 - eps * len(targets)
         for j, t in enumerate(targets):
             trans_ids[src_id, j] = t
-            trans_wts[src_id, j] = eps / len(targets)
+            trans_wts[src_id, j] = eps
 
     return true_weight.to(device), trans_ids.to(device), trans_wts.to(device)
 

@@ -79,7 +79,7 @@ class MultiHeadGPT2LMHeadModel(GPT2PreTrainedModel):
         return CausalLMOutput(loss=loss, logits=logits, hidden_states=(hidden,))
 
 
-def head_divergence(model):
+def head_similarity(model):
     """Mean pairwise cosine similarity between the three heads' weights.
 
     All heads start as identical copies of wte, so this begins at 1.0. If it

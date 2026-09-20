@@ -8,15 +8,15 @@ For each language (eng/nld/zho), builds a plain GPT2LMHeadModel with:
 The BabyLM eval pipeline can then load each export as a standard GPT-2.
 
 Usage:
-    python export_multihead.py --checkpoint output/gpt2-multihead/checkpoint-XXXX
+    python export_multihead.py --checkpoint $WORK/output/gpt2-multihead-seed0/checkpoint-XXXX
 """
 
 import argparse
 import os
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel, DebertaV2Tokenizer
+from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-from multihead_model import MultiHeadGPT2LMHeadModel, LANG2ID
+from mhead_model import MultiHeadGPT2LMHeadModel, LANG2ID
 
 ID2LANG = {v: k for k, v in LANG2ID.items()}
 
@@ -31,9 +31,9 @@ def export(checkpoint_path, output_dir=None, tokenizer_path=None):
     mh_config = mh_model.config
 
     if tokenizer_path:
-        tokenizer = DebertaV2Tokenizer.from_pretrained(tokenizer_path)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(tokenizer_path)
     else:
-        tokenizer = DebertaV2Tokenizer.from_pretrained(checkpoint_path)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint_path)
 
     trunk_state = mh_model.transformer.state_dict()
 

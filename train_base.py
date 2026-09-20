@@ -5,12 +5,11 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from transformers import set_seed
-from transformers import AutoConfig, AutoModelForCausalLM, DebertaV2Tokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizerFast
 from transformers.optimization import get_cosine_schedule_with_warmup
 from datasets import load_dataset
 
 from preprocessing import tokenize, padding_collate_fn, group_texts
-from soft_labels import build_soft_map, compile_tables, soft_label_loss
 
 try:
     import wandb
@@ -30,11 +29,8 @@ parser.add_argument("--grad_acc", type=int, default=1, help="Split the batch siz
 parser.add_argument("--lr", type=float, default=0.007)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--cpus", type=int, default=10)
-parser.add_argument("--logging_steps", type=int, default=100)
-parser.add_argument("--eval_steps", type=int, default=1000)
-parser.add_argument("--save_steps", type=int, default=1000)
-parser.add_argument("--all_checkpoints", action="store_true", help="Save and evaluate model every 1/10/100M tokens, \
-                    per challenge stipulations. Overrides eval_steps and save_steps.")
+parser.add_argument("--dl_workers", type=int, default=4,
+                    help="DataLoader worker processes per loader")
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
@@ -44,46 +40,47 @@ parser.add_argument("--pretrained", action="store_true", help="Load pretrained m
 parser.add_argument("--eval_only", action="store_true", help="Evaluate only")
 parser.add_argument("--debug", action="store_true", help="Activates debug mode")
 parser.add_argument("--wandb", action="store_true", help="Report to wandb")
-parser.add_argument("--lamb", action="store_true", help="LAMB optimization")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
-
-# ---- soft-label cross-lingual alignment ----
-parser.add_argument("--soft_label", action="store_true", help="Use dictionary soft-label alignment loss")
-parser.add_argument("--soft_eps", type=float, default=0.20, help="Probability mass moved to translations")
-parser.add_argument("--soft_max_trans", type=int, default=4, help="Max translations per source token (K)")
-parser.add_argument("--soft_dict_en_nl", type=str, default="data/dictionaries/en-nl.txt")
-parser.add_argument("--soft_dict_en_zh", type=str, default="data/dictionaries/en-zh.txt")
 
 def evaluate(model, dataloader, args):
     model.eval()
     correct = 0
     total = 0
-    avg_loss = 0
+    loss_sum = 0.0
+    n_batches = 0
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
             if len(batch["input_ids"]) == 0:
                 continue # NOTE: not sure why this happens in 100M case...
 
+            # Causal LM: no masking. Labels = input_ids; the model shifts internally.
             batches = split_batch(batch, args)
             for minibatch in batches:
                 with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                    outputs = model(**move_dict_to_cuda(minibatch))
+                    outputs = model(**move_dict_to_cuda(minibatch), use_cache=False)
 
-                avg_loss += outputs.loss.item()
-                logits = outputs.logits
+                loss_sum += outputs.loss.item()
+                n_batches += 1
 
-                # shift by one: position t predicts token t+1
-                preds = logits[:, :-1, :].argmax(dim=-1)
-                labels = minibatch["labels"][:, 1:].to(device=logits.device)
+                # Next-token accuracy: position t predicts token t+1, so shift by one.
+                logits = outputs.logits                       # [B, T, V]
+                labels = minibatch["labels"].to(device=logits.device)
+                shift_logits = logits[:, :-1, :]
+                shift_labels = labels[:, 1:]
+                preds = shift_logits.argmax(dim=-1)
 
-                label_mask = labels != -100
-                correct += (preds[label_mask] == labels[label_mask]).sum().item()
-                total += preds[label_mask].numel()
+                pad_mask = shift_labels != -100
+                correct += (preds[pad_mask] == shift_labels[pad_mask]).sum().item()
+                total += pad_mask.sum().item()
 
     model.train()
-    return {'acc': 100 * correct / total, 'loss': avg_loss / (len(dataloader) * args.grad_acc)}
+    avg_loss = loss_sum / max(n_batches, 1)
+    return {
+        'acc': 100 * correct / max(total, 1),
+        'loss': avg_loss,
+    }
 
 
 def regroup_texts(args, max_seq_len):
@@ -104,7 +101,7 @@ def regroup_texts(args, max_seq_len):
     train_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['train'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=True, 
         collate_fn=padding_collate_fn
         )
@@ -112,7 +109,7 @@ def regroup_texts(args, max_seq_len):
     eval_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['validation'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=False, 
         collate_fn=padding_collate_fn
         )
@@ -171,31 +168,11 @@ def calculate_total_steps(args):
         total_steps = total_steps + batches_per_epoch * (args.epochs - cur_epoch)
         return total_steps
 
-def is_step(step_type: str, global_step: int, args):
-    # step_arg = args.logging_steps, args.save_steps, or args.eval_steps
-    step_arg = getattr(args, f'{step_type}_steps')
-
-    if args.all_checkpoints:
-        if global_step in args.checkpoints:
-            return True
-    else:
-        if global_step % step_arg == 0 and global_step != 0:
-            return True
-        
-    return False
-
-
-
 def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.flops:
         from fvcore.nn import FlopCountAnalysis
 
-
-    if args.lamb:
-        from bitsandbytes.optim import LAMB  # imported lazily so the script runs without bitsandbytes unless --lamb
-        optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=args.weight_decay)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
     model.train()
@@ -235,21 +212,11 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
 
                         outputs = model(**move_dict_to_cuda(minibatch))
-
-                        # ----- main loss: soft-label alignment or standard CLM -----
+                        loss = outputs.loss
+                        
+                        # Add z-loss
                         logits = outputs.logits  # [B,T,V]
                         labels = minibatch["labels"].to(device=logits.device)
-                        if args.soft_label:
-                            loss = soft_label_loss(
-                                logits, labels,
-                                args.soft_true_weight,
-                                args.soft_trans_ids,
-                                args.soft_trans_wts,
-                            )
-                        else:
-                            loss = outputs.loss
-
-                        # Add z-loss
                         valid = labels.ne(-100)
                         z = torch.logsumexp(logits, dim=-1)  # [B,T]
                         z = z.masked_select(valid)
@@ -266,15 +233,15 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # ----- LOGGING -----
-                if is_step("logging", global_step, args):
+                if global_step in args.checkpoints:
+                    # ----- LOGGING -----
                     epoch_float = global_step * args.epochs / args.total_steps
                     print(f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
-                    
+                
                     if args.log_gpu_mem:
                         print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
                         print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-                    
+                
                     if args.wandb:
                         log_dict = {
                             "epoch": epoch_float,
@@ -288,10 +255,9 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             })
                         wandb.log(log_dict)
 
-                # ----- EVALUATION -----
-                if is_step("eval", global_step, args):
+                    # ----- EVALUATION -----
                     metrics = evaluate(model, eval_dataloader, args)
-                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f}", flush=True)
+                    print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f} -----", flush=True)
 
                     if args.wandb:
                         wandb.log({
@@ -299,12 +265,12 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             "eval_loss": metrics["loss"],
                         })
 
-                # ----- SAVING -----
-                if is_step("save", global_step, args):
+                    # ----- SAVING -----
                     save_path = os.path.join(args.output_path, f"checkpoint-{global_step}")
                     model.save_pretrained(save_path)
                     tokenizer.save_pretrained(save_path)
                     print(f"----- Saved checkpoint to: {save_path} -----", flush=True)
+
 
                 pbar.update(1)
                 global_step += 1
@@ -342,7 +308,7 @@ def main():
             config=vars(args),   
         )
 
-    tokenizer = DebertaV2Tokenizer.from_pretrained(args.tokenizer, do_lower_case=args.lower)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer)
 
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
 
@@ -362,15 +328,6 @@ def main():
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of model parameters: {num_params}")
-
-    # Build soft-label alignment tables (once), indexed by token id.
-    if args.soft_label:
-        print("Building soft-label alignment tables...")
-        soft_map = build_soft_map(tokenizer, args.soft_dict_en_nl, args.soft_dict_en_zh)
-        args.soft_true_weight, args.soft_trans_ids, args.soft_trans_wts = compile_tables(
-            soft_map, len(tokenizer), eps=args.soft_eps, K=args.soft_max_trans, device="cuda:0"
-        )
-        print(f"Soft-label map: {len(soft_map)} source tokens, eps={args.soft_eps}, K={args.soft_max_trans}")
 
     dataset = load_dataset('text', data_files={'train': args.train_data, 'validation': args.valid_data})
 
@@ -421,7 +378,7 @@ def main():
     train_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['train'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=True, 
         collate_fn=padding_collate_fn,
     )
@@ -429,7 +386,7 @@ def main():
     eval_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['validation'], 
         batch_size=args.batch_size, 
-        num_workers=args.cpus,
+        num_workers=args.dl_workers,
         shuffle=False, 
         collate_fn=padding_collate_fn,
     )

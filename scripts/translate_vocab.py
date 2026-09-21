@@ -5,8 +5,8 @@ import re
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-VOCAB = "data/prealign_vocab.txt"
-OUTPUT = "data/prealign_triplets.tsv"
+VOCAB = "data/alignment_vocab.txt"
+OUTPUT = "data/alignment_triplets.tsv"
 
 PROMPT = (
     "Translate the English word into Dutch and Simplified Chinese.\n"

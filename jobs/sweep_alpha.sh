@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J prealign-sweep
-#SBATCH -p a100
-#SBATCH --gres=gpu:a100:1
+#SBATCH -p a40
+#SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=03:00:00
+#SBATCH --time=08:00:00
 #SBATCH -o logs/log_%j.out
 #SBATCH -e logs/log_%j.err
 

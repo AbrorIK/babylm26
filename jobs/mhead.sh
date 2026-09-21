@@ -3,7 +3,7 @@
 #SBATCH -p a100
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=12:00:00
+#SBATCH --time=10:00:00
 #SBATCH --array=0-2
 #SBATCH -o logs/log_%A_%a.out
 #SBATCH -e logs/log_%A_%a.err
@@ -35,7 +35,6 @@ source .venv/bin/activate
 export PYTHONUNBUFFERED=1
 
 # ---- Storage ----
-# Model outputs go to $WORK (10 TB, shared, not backed up); $HOME is full.
 if [ ! -d "$WORK/output" ]; then
     mkdir "$WORK/output"
 fi
@@ -59,7 +58,7 @@ python train_mhead.py \
     --model_path "gpt2" \
     --max_seq_len "0:64,5:256" \
     --batch_size 256 \
-    --grad_acc 8 \
+    --grad_acc 1 \
     --epochs 10 \
     --lr 5e-4 \
     --seed $SEED \
@@ -73,12 +72,17 @@ echo "=========================================="
 # Find the last checkpoint
 LAST_CKPT=$(ls -d $OUTPUT_DIR/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
 if [ -n "$LAST_CKPT" ]; then
-    python export_multihead.py \
+    if python export_mhead.py \
         --checkpoint $LAST_CKPT \
-        --tokenizer $TOKENIZER_DIR
-    echo "Export done: $LAST_CKPT-export/{eng,nld,zho}"
+        --tokenizer $TOKENIZER_DIR; then
+        echo "Export done: $LAST_CKPT-export/{eng,nld,zho}"
+    else
+        echo "ERROR: export failed for $LAST_CKPT"
+        exit 1
+    fi
 else
-    echo "No checkpoint found to export."
+    echo "ERROR: no checkpoint found to export in $OUTPUT_DIR"
+    exit 1
 fi
 
 echo "=========================================="

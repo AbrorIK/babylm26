@@ -1,11 +1,10 @@
 """
 Triplet soft-label cross-lingual alignment for causal LM training.
 
-Given (english, dutch, chinese) triplets, we nudge the model so that when it
-predicts an English word, a little probability mass also lands on the FIRST
-token of each translation. Only the first token is modelled: the rest of the
-translation is ignored, which keeps the target well defined under left-to-right
-decoding.
+Given (english, dutch, chinese) triplets, when the model predicts an English word, 
+a little probability mass also lands on the FIRST token of each translation. 
+Only the first token is modelled: the rest of the translation is ignored, 
+which keeps the target well defined under left-to-right decoding.
 
 Keys are English words that are a single token, so one token id means one word.
 """

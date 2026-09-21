@@ -1,9 +1,7 @@
 # Core runtime
 torch>=2.1.0
-# Qwen3 architecture support (used only by data_prep/translate_vocab.py) needs >=4.51
-transformers==4.57.6
+transformers
 datasets>=2.18.0
-# tokenizer is trained and shipped as tokenizer.json (see tokenizer_training.py)
 tokenizers>=0.20
 sentencepiece>=0.1.99   # no longer used for training; kept for reading old models
 numpy>=1.23

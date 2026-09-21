@@ -316,6 +316,13 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     tokenizer.save_pretrained(save_path)
 
     if args.wandb:
+        # The loop exits before global_step reaches total_steps, so without this
+        # the final eval never reaches W&B and the run stops at ~90%.
+        wandb.log({
+            "epoch": args.epochs,
+            "eval_acc": metrics["acc"],
+            "eval_loss": metrics["loss"],
+        })
         wandb.finish()
 
 def parse_max_seq_len(max_seq_len):

@@ -341,6 +341,11 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     tokenizer.save_pretrained(save_path)
 
     if args.wandb:
+        wandb.log({
+            "epoch": args.epochs,
+            "eval_acc": metrics["acc"],
+            "eval_loss": metrics["loss"],
+        })
         wandb.finish()
 
 def parse_max_seq_len(max_seq_len):

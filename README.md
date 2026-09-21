@@ -46,8 +46,8 @@ and validation data, and the three seeds vary only initialisation, batch order,
 and (for the contrastive condition) the word-group sampling in `prealign.py`.
 
 ```bash
-bash jobs/submit_all_seeds.sh                               # 4 arrays x 3 seeds = 12 runs
-bash jobs/submit_all_seeds.sh baseline softlabel multihead  # or a subset
+bash jobs/submit_all.sh                               # 4 arrays x 3 seeds = 12 runs
+bash jobs/submit_all.sh baseline softlabel multihead  # or a subset
 ```
 
 The submit script creates each `logs/<condition>/` directory before submitting,
@@ -56,17 +56,17 @@ will not create a missing directory — the job fails instead. Submitting a job 
 hand therefore needs the directory first:
 
 ```bash
-mkdir -p logs/baseline && sbatch jobs/job_train_baseline.sh
+mkdir -p logs/baseline && sbatch jobs/base.sh
 ```
 
-The same applies to the two jobs `submit_all_seeds.sh` does not cover:
-`logs/sweep/` for `job_prealign_sweep.sh`, `logs/translate/` for
-`job_translate.sh`.
+The same applies to the two jobs `submit_all.sh` does not cover:
+`logs/sweep/` for `sweep_alpha.sh`, `logs/translate/` for
+`translate.sh`.
 
 To rerun a single seed, select its array index (index i is seed i):
 
 ```bash
-sbatch --array=1 jobs/job_train_contrastive.sh
+sbatch --array=1 jobs/contrastive.sh
 ```
 
 Checkpoints land in `$WORK/output/gpt2-<condition>-seed<N>/`, whose basename is
@@ -80,8 +80,8 @@ because `$HOME` (100 GB, backed up) is full and holds the code, data and logs.
 `$WORK` also limits the number of files, so only few-and-large things belong
 there — checkpoints qualify, the virtualenv and caches do not.
 
-Note: `jobs/job_train_contrastive.sh` was previously named
-`job_train_prealign.sh` and wrote to `output/gpt2-multihead-prealign`. That name
+Note: `jobs/contrastive.sh` was previously named
+`prealign.sh` and wrote to `output/gpt2-multihead-prealign`. That name
 was a mislabel — `train_contrastive.py` builds a plain `AutoModelForCausalLM`
 and has no multi-head component.
 
@@ -192,7 +192,7 @@ across every file.
 ```bash
 python data_prep/extract_vocab.py          # -> data/prealign_vocab.txt (12k lemmas)
 sbatch jobs/job_translate_test.sh          # 10 words, check the output format
-sbatch jobs/job_translate.sh               # -> data/prealign_triplets.tsv (~30 min)
+sbatch jobs/translate.sh               # -> data/prealign_triplets.tsv (~30 min)
 ```
 
 `extract_vocab.py` POS-tags in context, keeps content words only (dropping

@@ -21,7 +21,7 @@ export https_proxy=http://proxy.nhr.fau.de:80
 PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
 
-source .venv/bin/activate
+source $HOME/thesis/.venv/bin/activate
 
 export PYTHONUNBUFFERED=1
 

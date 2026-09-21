@@ -30,14 +30,12 @@ export https_proxy=http://proxy.nhr.fau.de:80
 PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
 
-source .venv/bin/activate
+source $HOME/thesis/.venv/bin/activate
 
 export PYTHONUNBUFFERED=1
 
 # ---- Storage ----
-if [ ! -d "$WORK/output" ]; then
-    mkdir "$WORK/output"
-fi
+mkdir -p "$WORK/output"
 
 # ---- Configuration Variables ----
 TRAIN_DATA="data/bb26_tagged_train.tsv"

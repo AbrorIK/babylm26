@@ -131,6 +131,7 @@ All flags are explained here:
 --lamb                  Use LAMB optimizer instead of AdamW.
 --lower                 Lowercase all input text.
 --soft                  Use soft masking strategy.
+--flops                 Compute FLOPs during training.
 --mask_decay            Mask decay rate. For example, 0.1 decays masking probability linearly by 0.1 over training.
 ```
 

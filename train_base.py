@@ -41,7 +41,6 @@ parser.add_argument("--eval_only", action="store_true", help="Evaluate only")
 parser.add_argument("--debug", action="store_true", help="Activates debug mode")
 parser.add_argument("--wandb", action="store_true", help="Report to wandb")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
-parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--log_gpu_mem", action="store_true", help="Log detailed GPU memory usage")
 
 def evaluate(model, dataloader, args):
@@ -169,9 +168,6 @@ def calculate_total_steps(args):
         return total_steps
 
 def train(args, model, tokenizer, train_dataloader, eval_dataloader):
-    if args.flops:
-        from fvcore.nn import FlopCountAnalysis
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
@@ -200,17 +196,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 for minibatch in batches:
 
                     with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
-                        if args.flops:
-                            model.eval()
-                            flops = FlopCountAnalysis(model, tuple(move_dict_to_cuda(minibatch).values()))
-                            flops = flops.by_operator()
-                            total = 0
-                            for key in flops:
-                                total += flops[key]
-                            print(f"Estimated Total FLOPs: {total*3*args.total_steps}")
-                            exit()
-
-
                         outputs = model(**move_dict_to_cuda(minibatch))
                         loss = outputs.loss
                         

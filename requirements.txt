@@ -15,7 +15,4 @@ accelerate>=0.30.0
 # Optional: experiment tracking (only if using --wandb)
 wandb>=0.16.0
 
-# Optional: FLOPs estimation (only if using --flops)
-fvcore>=0.1.5
-
 python-dotenv>=1.0.0

@@ -42,8 +42,8 @@ mkdir -p "$WORK/output"
 TRAIN_DATA="data/bb26_train.txt"
 VALID_DATA="data/bb26_validation.txt"
 TOKENIZER_DIR="tokenizers/bb26-40k"
-OUTPUT_DIR="$WORK/output/gpt2-softlabel-seed$SEED"
-TRIPLETS="data/prealign_triplets.tsv"
+OUTPUT_DIR="$WORK/output/softlabel-seed$SEED"
+TRIPLETS="data/alignment_triplets.tsv"
 
 export WANDB_RUN_GROUP="softlabel"
 

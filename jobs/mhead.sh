@@ -41,7 +41,7 @@ mkdir -p "$WORK/output"
 TRAIN_DATA="data/bb26_tagged_train.tsv"
 VALID_DATA="data/bb26_tagged_validation.tsv"
 TOKENIZER_DIR="tokenizers/bb26-40k"
-OUTPUT_DIR="$WORK/output/gpt2-multihead-seed$SEED"
+OUTPUT_DIR="$WORK/output/multihead-seed$SEED"
 
 export WANDB_RUN_GROUP="multihead"
 

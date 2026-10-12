@@ -3,7 +3,7 @@
 #SBATCH -p a100
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=12:00:00
+#SBATCH --time=10:00:00
 #SBATCH --array=0-2
 #SBATCH -o logs/log_%A_%a.out
 #SBATCH -e logs/log_%A_%a.err
@@ -30,21 +30,18 @@ export https_proxy=http://proxy.nhr.fau.de:80
 PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
 
-source .venv/bin/activate
+source $HOME/thesis/.venv/bin/activate
 
 export PYTHONUNBUFFERED=1
 
 # ---- Storage ----
-# Model outputs go to $WORK (10 TB, shared, not backed up); $HOME is full.
-if [ ! -d "$WORK/output" ]; then
-    mkdir "$WORK/output"
-fi
+mkdir -p "$WORK/output"
 
 # ---- Configuration Variables ----
 TRAIN_DATA="data/bb26_tagged_train.tsv"
 VALID_DATA="data/bb26_tagged_validation.tsv"
 TOKENIZER_DIR="tokenizers/bb26-40k"
-OUTPUT_DIR="$WORK/output/gpt2-multihead-seed$SEED"
+OUTPUT_DIR="$WORK/output/multihead-seed$SEED"
 
 export WANDB_RUN_GROUP="multihead"
 
@@ -59,7 +56,7 @@ python train_mhead.py \
     --model_path "gpt2" \
     --max_seq_len "0:64,5:256" \
     --batch_size 256 \
-    --grad_acc 8 \
+    --grad_acc 1 \
     --epochs 10 \
     --lr 5e-4 \
     --seed $SEED \
@@ -73,12 +70,17 @@ echo "=========================================="
 # Find the last checkpoint
 LAST_CKPT=$(ls -d $OUTPUT_DIR/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
 if [ -n "$LAST_CKPT" ]; then
-    python export_multihead.py \
+    if python export_mhead.py \
         --checkpoint $LAST_CKPT \
-        --tokenizer $TOKENIZER_DIR
-    echo "Export done: $LAST_CKPT-export/{eng,nld,zho}"
+        --tokenizer $TOKENIZER_DIR; then
+        echo "Export done: $LAST_CKPT-export/{eng,nld,zho}"
+    else
+        echo "ERROR: export failed for $LAST_CKPT"
+        exit 1
+    fi
 else
-    echo "No checkpoint found to export."
+    echo "ERROR: no checkpoint found to export in $OUTPUT_DIR"
+    exit 1
 fi
 
 echo "=========================================="

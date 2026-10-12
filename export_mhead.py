@@ -8,7 +8,7 @@ For each language (eng/nld/zho), builds a plain GPT2LMHeadModel with:
 The BabyLM eval pipeline can then load each export as a standard GPT-2.
 
 Usage:
-    python export_multihead.py --checkpoint $WORK/output/gpt2-multihead-seed0/checkpoint-XXXX
+    python export_mhead.py --checkpoint $WORK/output/gpt2-multihead-seed0/checkpoint-XXXX
 """
 
 import argparse

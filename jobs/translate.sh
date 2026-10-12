@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J qwen-translate
-#SBATCH -p a100
-#SBATCH --gres=gpu:a100:1
+#SBATCH -p a40
+#SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=02:00:00
+#SBATCH --time=05:00:00
 #SBATCH -o logs/log_%j.out
 #SBATCH -e logs/log_%j.err
 
@@ -21,7 +21,7 @@ export https_proxy=http://proxy.nhr.fau.de:80
 PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
 
-source .venv/bin/activate
+source $HOME/thesis/.venv/bin/activate
 
 export PYTHONUNBUFFERED=1
 

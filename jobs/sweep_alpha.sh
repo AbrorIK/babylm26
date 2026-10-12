@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J prealign-sweep
-#SBATCH -p a100
-#SBATCH --gres=gpu:a100:1
+#SBATCH -p a40
+#SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=03:00:00
+#SBATCH --time=08:00:00
 #SBATCH -o logs/log_%j.out
 #SBATCH -e logs/log_%j.err
 
@@ -32,14 +32,12 @@ export https_proxy=http://proxy.nhr.fau.de:80
 
 PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
-source .venv/bin/activate
+source $HOME/thesis/.venv/bin/activate
 export PYTHONUNBUFFERED=1
 
 # ---- Storage ----
 # Model outputs go to $WORK (10 TB, shared, not backed up); $HOME is full.
-if [ ! -d "$WORK/output" ]; then
-    mkdir "$WORK/output"
-fi
+mkdir -p "$WORK/output"
 
 TRAIN_DATA="data/bb26_tagged_train.tsv"
 VALID_DATA="data/bb26_tagged_validation.tsv"

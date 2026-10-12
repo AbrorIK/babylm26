@@ -30,21 +30,19 @@ export https_proxy=http://proxy.nhr.fau.de:80
 PROJECT_DIR=$HOME/thesis/babylm26
 cd $PROJECT_DIR
 
-source .venv/bin/activate
+source $HOME/thesis/.venv/bin/activate
 
 export PYTHONUNBUFFERED=1
 
 # ---- Storage ----
-if [ ! -d "$WORK/output" ]; then
-    mkdir "$WORK/output"
-fi
+mkdir -p "$WORK/output"
 
 # ---- Configuration Variables ----
-TRAIN_DATA="data/bb26_tagged_train.tsv"
-VALID_DATA="data/bb26_tagged_validation.tsv"
+TRAIN_DATA="data/bb26_train.txt"
+VALID_DATA="data/bb26_validation.txt"
 TOKENIZER_DIR="tokenizers/bb26-40k"
-OUTPUT_DIR="$WORK/output/gpt2-contrastive-seed$SEED"
-TRIPLETS="data/prealign_triplets.tsv"
+OUTPUT_DIR="$WORK/output/contrastive-seed$SEED"
+TRIPLETS="data/alignment_triplets.tsv"
 
 export WANDB_RUN_GROUP="contrastive"
 
@@ -75,7 +73,7 @@ python train_contrastive.py \
     --model_path "gpt2" \
     --max_seq_len "0:64,5:256" \
     --batch_size 256 \
-    --grad_acc 8 \
+    --grad_acc 1 \
     --epochs 10 \
     --lr 5e-4 \
     --seed $SEED \
